@@ -88,14 +88,11 @@ def test_dialog_tracking_is_independent_of_scope() -> None:
     assert omitted is not None
     assert omitted.scope == SCOPE_OMIT_MATURE
     assert omitted.track_struggle is True
-    assert ui.tracking_to_persist(omitted) is True
 
     all_seen = ui.free_review_dialog_choice(True, False, False)
     assert all_seen is not None
     assert all_seen.scope == SCOPE_ALL_SEEN
     assert all_seen.track_struggle is False
-    assert ui.tracking_to_persist(all_seen) is False
-    assert ui.tracking_to_persist(None) is None
     assert ui.free_review_dialog_choice(False, True, True) is None
 
 

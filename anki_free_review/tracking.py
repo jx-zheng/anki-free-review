@@ -101,54 +101,28 @@ def begin_session_tracking(enabled: bool, *, now: float | None = None) -> Sessio
     return SessionStats(started_at=now)
 
 
-def _in_tracked_deck(
-    stats: SessionStats | None,
-    *,
-    current_deck_id: int | None,
-    filtered_deck_id: int | None,
-) -> bool:
-    if stats is None or filtered_deck_id is None or current_deck_id is None:
-        return False
-    return int(current_deck_id) == int(filtered_deck_id)
-
-
 def note_card_seen(
-    stats: SessionStats | None,
-    *,
-    current_deck_id: int | None,
-    filtered_deck_id: int | None,
-    card_id: int,
+    stats: SessionStats | None, *, in_tracked_deck: bool, card_id: int
 ) -> bool:
     """Record a shown card. False when tracking is off or the deck is not ours."""
 
-    if not _in_tracked_deck(
-        stats, current_deck_id=current_deck_id, filtered_deck_id=filtered_deck_id
-    ):
+    if stats is None or not in_tracked_deck:
         return False
-    assert stats is not None
     stats.note_seen(card_id)
     return True
 
 
 def accept_review_answer(
-    stats: SessionStats | None,
-    *,
-    current_deck_id: int | None,
-    filtered_deck_id: int | None,
-    card_id: int,
-    ease: int,
+    stats: SessionStats | None, *, in_tracked_deck: bool, card_id: int, ease: int
 ) -> str | None:
-    """Count an answer given in the practice deck. Other decks are ignored.
+    """Count an answer when the reviewer is still on the practice deck.
 
-    Gate on the deck being reviewed, not ``card.did``. Good and Easy return
-    the card to its home deck before the reviewer hook runs.
+    The caller decides that. Good and Easy return the card home before the
+    reviewer hook runs, so ``card.did`` is not the practice deck.
     """
 
-    if not _in_tracked_deck(
-        stats, current_deck_id=current_deck_id, filtered_deck_id=filtered_deck_id
-    ):
+    if stats is None or not in_tracked_deck:
         return None
-    assert stats is not None
     return stats.record_answer(card_id, ease)
 
 

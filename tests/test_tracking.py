@@ -145,35 +145,21 @@ def test_tracking_off_does_not_record_or_require_a_summary() -> None:
     assert begin_session_tracking(False, now=5) is None
     assert should_show_summary(None) is False
     assert (
-        accept_review_answer(
-            None, current_deck_id=1, filtered_deck_id=1, card_id=4, ease=1
-        )
-        is None
+        accept_review_answer(None, in_tracked_deck=True, card_id=4, ease=1) is None
     )
-    assert (
-        note_card_seen(None, current_deck_id=1, filtered_deck_id=1, card_id=4)
-        is False
-    )
+    assert note_card_seen(None, in_tracked_deck=True, card_id=4) is False
 
     stats = begin_session_tracking(True, now=0)
     assert (
-        accept_review_answer(
-            stats, current_deck_id=2, filtered_deck_id=1, card_id=4, ease=1
-        )
-        is None
+        accept_review_answer(stats, in_tracked_deck=False, card_id=4, ease=1) is None
     )
     assert stats is not None
     assert stats.answered == 0
     assert stats.struggle_card_ids == set()
-    assert (
-        note_card_seen(stats, current_deck_id=2, filtered_deck_id=1, card_id=4)
-        is False
-    )
+    assert note_card_seen(stats, in_tracked_deck=False, card_id=4) is False
     assert stats.seen_card_ids == set()
     assert (
-        accept_review_answer(
-            stats, current_deck_id=1, filtered_deck_id=1, card_id=4, ease=2
-        )
+        accept_review_answer(stats, in_tracked_deck=True, card_id=4, ease=2)
         == "struggle"
     )
     assert stats.struggle_card_ids == {4}

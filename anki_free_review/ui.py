@@ -38,9 +38,6 @@ from .tracking import (
 
 logger = logging.getLogger(__name__)
 
-# Anki loads this folder as the add-on module and reads config.json from it.
-ADDON_PACKAGE = "anki_free_review"
-
 CHOICE_ALL_SEEN = "All seen cards"
 CHOICE_OMIT_MATURE = "Omit mature cards"
 TRACK_STRUGGLE_LABEL = "Track struggle and session stats"
@@ -76,7 +73,6 @@ class _ActiveSession:
 _active = _ActiveSession()
 _stats_timer = None
 _stats_label = None
-_summary_suppressed = False
 
 
 def append_overview_button(links: list, *, deck_is_filtered: bool) -> None:
@@ -111,14 +107,6 @@ def free_review_dialog_choice(
     if scope is None:
         return None
     return FreeReviewDialogChoice(scope=scope, track_struggle=bool(track_struggle))
-
-
-def tracking_to_persist(choice: FreeReviewDialogChoice | None) -> bool | None:
-    """The checkbox value to save. None means the dialog was cancelled."""
-
-    if choice is None:
-        return None
-    return bool(choice.track_struggle)
 
 
 def ask_free_review_dialog(parent, *, track_struggle: bool) -> FreeReviewDialogChoice | None:
@@ -254,7 +242,7 @@ def _on_state_change(new_state: str, _old_state: str) -> None:
         # cleanup, so one Undo cannot bring the practice deck back by itself.
         cleanup_free_review_deck(mw.col, filtered_id)
     _show_snapshot_warnings()
-    show = stats if should_show_summary(stats) and not _summary_suppressed else None
+    show = stats if should_show_summary(stats) else None
     _return_to_source_later(new_state, source_id, show)
 
 
@@ -273,7 +261,7 @@ def _return_to_source_later(
             mw.moveToState("overview")
         elif mw.state == "deckBrowser":
             mw.deckBrowser.refresh()
-        if stats is not None and should_show_summary(stats):
+        if stats is not None:
             _show_summary_dialog(stats, source_id)
 
     QTimer.singleShot(0, go)
@@ -286,29 +274,20 @@ def _on_profile_did_open() -> None:
 
 
 def _on_profile_will_close() -> None:
-    # Runs before auto-sync on quit. A summary dialog here would block teardown.
-    global _summary_suppressed
-    _summary_suppressed = True
-    try:
-        _sweep()
-    finally:
-        _summary_suppressed = False
+    # Runs before auto-sync on quit.
+    _sweep()
 
 
 def _on_sync_will_start() -> None:
     from aqt import mw
 
-    global _summary_suppressed
-    # A modal summary would sit on top of the sync. End the session quietly.
-    _summary_suppressed = True
-    try:
-        if mw.state == "review" and _active.filtered_id:
-            # Leaving review runs _on_state_change, which deletes the practice deck.
-            mw.moveToState("deckBrowser")
-            return
-        _sweep()
-    finally:
-        _summary_suppressed = False
+    if mw.state == "review" and _active.filtered_id:
+        # Leaving review runs _on_state_change, which deletes the practice deck.
+        # Drop the tally first so that path does not open a summary over the sync.
+        _active.stats = None
+        mw.moveToState("deckBrowser")
+        return
+    _sweep()
 
 
 def _sweep() -> None:
@@ -343,15 +322,14 @@ def _start(deck_id: int) -> None:
     if not mw.col:
         return
     choice = ask_free_review_dialog(mw, track_struggle=_load_track_struggle())
-    persist = tracking_to_persist(choice)
-    if choice is None or persist is None:
+    if choice is None:
         return
-    _save_track_struggle(persist)
+    _save_track_struggle(choice.track_struggle)
 
     def op(col):
         return start_from_dialog_choice(col, deck_id, choice.scope)
 
-    _run_start(deck_id, persist, op)
+    _run_start(deck_id, choice.track_struggle, op)
 
 
 def _start_card_session(source_id: int, card_ids: list[int]) -> None:
@@ -418,7 +396,7 @@ def _show_summary_dialog(stats: SessionStats, source_id: int | None) -> None:
     review_ids = sorted(stats.struggle_card_ids)
     review_clicked = {"go": False}
 
-    if SUMMARY_REVIEW in actions and source_id:
+    if SUMMARY_REVIEW in actions:
         review = buttons.addButton(
             SUMMARY_REVIEW_BUTTON, QDialogButtonBox.ButtonRole.ActionRole
         )
@@ -429,7 +407,7 @@ def _show_summary_dialog(stats: SessionStats, source_id: int | None) -> None:
 
         qconnect(review.clicked, start_review)
 
-    if SUMMARY_BROWSER in actions and search:
+    if SUMMARY_BROWSER in actions:
         browser_button = buttons.addButton(
             SUMMARY_BROWSER_BUTTON, QDialogButtonBox.ButtonRole.ActionRole
         )
@@ -442,7 +420,7 @@ def _show_summary_dialog(stats: SessionStats, source_id: int | None) -> None:
     qconnect(buttons.rejected, dialog.reject)
     layout.addWidget(buttons)
     dialog.exec()
-    if review_clicked["go"] and source_id and review_ids:
+    if review_clicked["go"]:
         _start_card_session(int(source_id), review_ids)
 
 
@@ -464,68 +442,53 @@ def _on_reviewer_did_show_question(card) -> None:
     try:
         if card is None:
             return
-        current = _reviewing_active_deck()
+        in_deck = _reviewing_active_deck()
         if note_card_seen(
-            _active.stats,
-            current_deck_id=current,
-            filtered_deck_id=_active.filtered_id,
-            card_id=int(card.id),
+            _active.stats, in_tracked_deck=in_deck, card_id=int(card.id)
         ):
-            _refresh_stats_chrome()
+            _refresh_stats_chrome(in_tracked_deck=in_deck)
     except Exception:
         logger.exception("free-review struggle tracking failed")
 
 
 def _on_reviewer_did_answer_card(_reviewer, card, ease) -> None:
-    # The current deck is read from the collection. Good/Easy move the card
-    # home before this runs, so card.did is not the practice deck. The
-    # reviewer is still showing that deck.
     try:
         if card is None:
             return
-        current = _reviewing_active_deck()
+        in_deck = _reviewing_active_deck()
         kind = accept_review_answer(
             _active.stats,
-            current_deck_id=current,
-            filtered_deck_id=_active.filtered_id,
+            in_tracked_deck=in_deck,
             card_id=int(card.id),
             ease=int(ease),
         )
         if kind is not None:
-            _refresh_stats_chrome()
+            _refresh_stats_chrome(in_tracked_deck=in_deck)
     except Exception:
         logger.exception("free-review struggle tracking failed")
 
 
-def _reviewing_active_deck() -> int | None:
+def _reviewing_active_deck() -> bool:
+    """True when the reviewer is still showing this practice deck."""
+
     from aqt import mw
 
     if not mw.col or not _active.filtered_id:
-        return None
+        return False
     try:
         current = int(mw.col.decks.get_current_id())
     except Exception:
-        return None
-    if current != _active.filtered_id:
-        return None
-    return current
+        return False
+    return current == _active.filtered_id
 
 
-def _refresh_stats_chrome() -> None:
-    stats = _active.stats
-    if stats is None or not _active.filtered_id:
-        _hide_stats_label()
-        return
+def _refresh_stats_chrome(*, in_tracked_deck: bool | None = None) -> None:
     from aqt import mw
 
-    if not mw.col or mw.state != "review":
-        _hide_stats_label()
-        return
-    try:
-        if int(mw.col.decks.get_current_id()) != _active.filtered_id:
-            _hide_stats_label()
-            return
-    except Exception:
+    if in_tracked_deck is None:
+        in_tracked_deck = _reviewing_active_deck()
+    stats = _active.stats
+    if stats is None or mw.state != "review" or not in_tracked_deck:
         _hide_stats_label()
         return
     _show_stats_label(format_running_stats(stats, now=time.monotonic()))
@@ -614,11 +577,19 @@ def _finish_active_tracking() -> tuple[SessionStats | None, int | None]:
     return stats, source_id
 
 
+def _addon_package() -> str:
+    """Folder Anki actually loaded, including a numeric AnkiWeb id."""
+
+    from aqt import mw
+
+    return mw.addonManager.addonFromModule(__name__)
+
+
 def _load_track_struggle() -> bool:
     try:
         from aqt import mw
 
-        config = mw.addonManager.getConfig(ADDON_PACKAGE)
+        config = mw.addonManager.getConfig(_addon_package())
     except Exception:
         logger.debug("free-review config could not be read", exc_info=True)
         return False
@@ -629,8 +600,9 @@ def _save_track_struggle(enabled: bool) -> None:
     try:
         from aqt import mw
 
-        current = mw.addonManager.getConfig(ADDON_PACKAGE)
-        mw.addonManager.writeConfig(ADDON_PACKAGE, config_with_tracking(current, enabled))
+        package = _addon_package()
+        current = mw.addonManager.getConfig(package)
+        mw.addonManager.writeConfig(package, config_with_tracking(current, enabled))
     except Exception:
         logger.warning(
             "free-review could not save the struggle-tracking choice", exc_info=True

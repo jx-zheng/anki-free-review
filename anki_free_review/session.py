@@ -59,6 +59,11 @@ SNAPSHOT_CORRUPT_MESSAGE = (
 
 _SNAPSHOT_VERSION = 1
 _SEARCH_MARKERS = ("-is:new", "-is:suspended", "-is:buried")
+# Anki's browser calls a review card mature when its interval is at least 21 days.
+# 25.9.2 has no is:mature / is:young search term.
+MATURE_INTERVAL_DAYS = 21
+SCOPE_ALL_SEEN = "all"
+SCOPE_OMIT_MATURE = "omit_mature"
 # Day-numbered dues stay far below this. Preview Again/Hard write a unix time.
 _PREVIEW_DUE_TIMESTAMP = 1_000_000_000
 _snapshot_warnings: list[str] = []
@@ -101,20 +106,32 @@ class CardSnapshot:
     last_review_time: int | None
 
 
-def seen_card_search(col: Collection, deck_name: str) -> str:
+def seen_card_search(
+    col: Collection, deck_name: str, *, omit_mature: bool = False
+) -> str:
     """Search for seen cards in ``deck_name`` and its subdecks.
 
     Suspended and buried cards are excluded. Anki's filtered-deck builder
     also refuses to gather them, so the search matches what the deck can
     actually hold.
+
+    When ``omit_mature`` is set, cards with interval >= 21 days are excluded
+    (``-prop:ivl>=21``). Learning cards usually have interval 0, so they stay.
+    A relearning card keeps its previous interval, so a lapsed mature card
+    is excluded too.
     """
 
-    return col.build_search_string(
+    search = col.build_search_string(
         SearchNode(deck=deck_name),
         SearchNode(negated=SearchNode(card_state=SearchNode.CARD_STATE_NEW)),
         SearchNode(negated=SearchNode(card_state=SearchNode.CARD_STATE_SUSPENDED)),
         SearchNode(negated=SearchNode(card_state=SearchNode.CARD_STATE_BURIED)),
     )
+    if omit_mature:
+        search = col.build_search_string(
+            search, f"-prop:ivl>={MATURE_INTERVAL_DAYS}"
+        )
+    return search
 
 
 def snapshot_path(col: Collection) -> str:
@@ -131,11 +148,24 @@ def take_snapshot_warnings() -> list[str]:
     return found
 
 
-def start_free_review(col: Collection, source_deck_id: int) -> StartResult:
+def start_from_dialog_choice(
+    col: Collection, source_deck_id: int, scope: str | None
+) -> StartResult | None:
+    """Start a session, or do nothing when the dialog was cancelled."""
+
+    if scope is None:
+        return None
+    return start_free_review(col, source_deck_id, scope=scope)
+
+
+def start_free_review(
+    col: Collection, source_deck_id: int, *, scope: str = SCOPE_ALL_SEEN
+) -> StartResult:
     """Create the temporary filtered deck and gather seen cards into it.
 
-    Returns an unsuccessful result, and does not leave a deck behind, when
-    there is nothing to practice.
+    ``scope`` is ``SCOPE_ALL_SEEN`` or ``SCOPE_OMIT_MATURE``. Returns an
+    unsuccessful result, and does not leave a deck behind, when there is
+    nothing to practice.
     """
 
     if not col.v3_scheduler():
@@ -154,7 +184,7 @@ def start_free_review(col: Collection, source_deck_id: int) -> StartResult:
     cleanup_all_free_review_sessions(col)
 
     deck_name = col.decks.name(DeckId(source_deck_id))
-    search = seen_card_search(col, deck_name)
+    search = seen_card_search(col, deck_name, omit_mature=_omit_mature(scope))
     card_ids = list(col.find_cards(search))
     if not card_ids:
         return _fail(EMPTY_MESSAGE)
@@ -268,6 +298,14 @@ def cleanup_all_free_review_sessions(col: Collection) -> int:
 
 def is_free_review_deck(col: Collection, deck_id: int) -> bool:
     return _is_our_deck(col, int(deck_id))
+
+
+def _omit_mature(scope: str) -> bool:
+    if scope == SCOPE_ALL_SEEN:
+        return False
+    if scope == SCOPE_OMIT_MATURE:
+        return True
+    raise ValueError(f"unknown free-review scope: {scope}")
 
 
 def _fail(message: str) -> StartResult:

@@ -6,9 +6,14 @@ This is the same idea as Custom Study / a filtered deck with **Reschedule cards 
 
 ## What it does
 
-On the deck overview, click **Free Review** (shortcut **F**). Or open the gear menu in the deck list and choose **Free Review**.
+On the deck overview, click **Free Review** (shortcut **F**). Or open the gear menu in the deck list and choose **Free Review**. A small dialog asks which cards to practice. Cancel closes it and does not create a deck.
 
-Anki builds a temporary filtered deck named `Free Review - <deck>` (parent `::` names are shown as ` / `, so the practice deck is not nested). Only cards that have already been seen are gathered:
+- **All seen cards** — learning, young, and mature.
+- **Omit mature cards** — learning and young only.
+
+A card is mature when its interval is **at least 21 days** (`prop:ivl>=21`). That is the cutoff Anki's browser uses. Anki 25.9.2 has no `is:mature` search term. Learning cards usually have an interval of 0, so they stay. A relearning card keeps its previous interval, so a lapsed mature card is omitted too.
+
+Anki then builds a temporary filtered deck named `Free Review - <deck>` (parent `::` names are shown as ` / `, so the practice deck is not nested). Only cards that have already been seen are gathered:
 
 | Included | Excluded |
 | --- | --- |
@@ -21,7 +26,7 @@ Buried and suspended cards are excluded on purpose. Anki's filtered-deck builder
 
 Cards are ordered at random. Again shows the card again after 1 minute and Hard after 10 minutes, inside this session only. Good and Easy return the card to its home deck. Those delays are the ones Anki's own non-rescheduling custom study uses. They are not written onto the home-deck schedule.
 
-If the deck has no seen cards, Anki shows "No seen cards to practice in this deck." and does not create a deck.
+If the deck has no matching cards (nothing seen, or only mature cards when those are omitted), Anki shows "No seen cards to practice in this deck." and does not create a deck.
 
 When you leave the reviewer (finish, Back, Decks), quit, or sync, the temporary deck is deleted and cards are back in the original decks. The same cleanup runs on profile open, before automatic sync, so a crash does not leave `Free Review - ...` decks behind or upload them.
 

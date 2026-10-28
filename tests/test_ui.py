@@ -68,6 +68,15 @@ def test_overview_url_dispatches_free_review() -> None:
     assert seen[-1] == "study"
 
 
+def test_dialog_cancel_and_scope_mapping() -> None:
+    from anki_free_review.session import SCOPE_ALL_SEEN, SCOPE_OMIT_MATURE
+
+    assert ui.free_review_scope_or_cancel(False, True) is None
+    assert ui.free_review_scope_or_cancel(False, False) is None
+    assert ui.free_review_scope_or_cancel(True, False) == SCOPE_ALL_SEEN
+    assert ui.free_review_scope_or_cancel(True, True) == SCOPE_OMIT_MATURE
+
+
 def test_session_end_rules() -> None:
     assert ui.should_end_session("review", 5, 5) is False
     assert ui.should_end_session("review", 9, 5) is True

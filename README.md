@@ -42,7 +42,7 @@ While the session is open, a line between the card and the answer buttons shows:
 - **Answered** counts every Again, Hard, Good, and Easy press. One card can add more than one.
 - **Solid** is Good or Easy.
 - **Struggle** is Again or Hard.
-- The clock is time since this session started. It updates when a card is shown or answered, not on Anki's per-card timer. The summary still uses the full time until you leave the reviewer.
+- The clock is time since this session started. While the running line is visible it advances about once a second. Showing or answering a card still refreshes the answered, solid, and struggle counts right away. The clock stops when you leave the reviewer, when the summary opens, and when quit or sync clears the session. The summary uses the time until you leave the reviewer. A struggle-card revisit uses the same running line, so its clock ticks the same way.
 
 **Cards seen** (in the summary) is the number of distinct cards shown or answered.
 
@@ -134,7 +134,7 @@ The suite builds a temporary collection and does not touch a real profile. It ch
 
 - Seen cards in a parent deck, subdeck, and grandchild are gathered; new, suspended, buried, and other-deck cards are not.
 - All seen cards include interval ≥ 21. Omit mature (`-prop:ivl>=21`) keeps learning and young cards (interval 20 and interval 0) and leaves mature cards out. Answers plus cleanup still do not change scheduling fields. A deck of only mature cards shows the empty message and creates no deck. Cancelling the dialog creates nothing. The struggle-tracking checkbox is independent of All seen / Omit mature, and cancel does not change the saved checkbox.
-- Good and Easy count as solid. Again and Hard count as struggle. A card that gets Again or Hard stays in the struggle set after a later Good or Easy. Summary totals match that sequence. The running line is `Free Review: Answered N · Solid N · Struggle N · M:SS`.
+- Good and Easy count as solid. Again and Hard count as struggle. A card that gets Again or Hard stays in the struggle set after a later Good or Easy. Summary totals match that sequence. The running line is `Free Review: Answered N · Solid N · Struggle N · M:SS`. While that line is up, a one-second timer rewrites the clock and stops when the line is hidden or the label is gone. The tick does not record answers.
 - A tracked session plus cleanup, and a follow-up struggle-card session plus cleanup, leave scheduling fields unchanged. While the struggle deck is open, `odid` is the home deck and `reschedule` is false. The restore file has no struggle store. The browser search is `cid:…`.
 - Tracking off does not create struggle totals and does not require a summary. An empty struggle-id list creates no deck. Suspended and new cards are left out of the struggle deck and still match the browser `cid:` search. Undo after a struggle session does not bring the practice deck back.
 - The filtered deck is created with `reschedule` false, and the current scheduling state is preview, not a rescheduling filter.

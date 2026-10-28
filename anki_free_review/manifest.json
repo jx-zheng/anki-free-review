@@ -1,0 +1,8 @@
+{
+  "name": "Free Review",
+  "package": "anki_free_review",
+  "homepage": "https://github.com/jx-zheng/anki-free-review",
+  "human_version": "1.0.0",
+  "min_point_version": 231000,
+  "conflicts": []
+}

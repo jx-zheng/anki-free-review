@@ -42,7 +42,7 @@ While the session is open, a line between the card and the answer buttons shows:
 - **Answered** counts every Again, Hard, Good, and Easy press. One card can add more than one.
 - **Solid** is Good or Easy.
 - **Struggle** is Again or Hard.
-- The clock is time since this session started, not Anki's per-card timer on the More button.
+- The clock is time since this session started. It updates when a card is shown or answered, not on Anki's per-card timer. The summary still uses the full time until you leave the reviewer.
 
 **Cards seen** (in the summary) is the number of distinct cards shown or answered.
 

@@ -71,7 +71,6 @@ class _ActiveSession:
 
 
 _active = _ActiveSession()
-_stats_timer = None
 _stats_label = None
 
 
@@ -355,10 +354,6 @@ def _run_start(source_id: int, track_struggle: bool, op) -> None:
         _active.filtered_id = int(result.deck_id)
         _active.source_id = int(source_id)
         _active.stats = begin_session_tracking(track_struggle)
-        if _active.stats is not None:
-            _start_stats_timer()
-        else:
-            _stop_stats_timer()
         mw.col.decks.select(result.deck_id)
         mw.moveToState("review")
 
@@ -482,11 +477,11 @@ def _reviewing_active_deck() -> bool:
     return current == _active.filtered_id
 
 
-def _refresh_stats_chrome(*, in_tracked_deck: bool | None = None) -> None:
+def _refresh_stats_chrome(*, in_tracked_deck: bool) -> None:
+    """Update the running line. Called when a card is shown or answered."""
+
     from aqt import mw
 
-    if in_tracked_deck is None:
-        in_tracked_deck = _reviewing_active_deck()
     stats = _active.stats
     if stats is None or mw.state != "review" or not in_tracked_deck:
         _hide_stats_label()
@@ -546,33 +541,12 @@ def _hide_stats_label() -> None:
     _stats_label.setText("")
 
 
-def _start_stats_timer() -> None:
-    global _stats_timer
-    from aqt import mw
-    from aqt.qt import QTimer
-    from aqt.utils import qconnect
-
-    if _stats_timer is None:
-        timer = QTimer(mw)
-        timer.setInterval(1000)
-        qconnect(timer.timeout, _refresh_stats_chrome)
-        _stats_timer = timer
-    if not _stats_timer.isActive():
-        _stats_timer.start()
-
-
-def _stop_stats_timer() -> None:
-    if _stats_timer is not None and _stats_timer.isActive():
-        _stats_timer.stop()
-
-
 def _finish_active_tracking() -> tuple[SessionStats | None, int | None]:
     stats = _active.stats
     source_id = _active.source_id
     _active.clear()
     if stats is not None:
         stats.freeze(now=time.monotonic())
-    _stop_stats_timer()
     _hide_stats_label()
     return stats, source_id
 

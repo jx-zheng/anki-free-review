@@ -102,3 +102,277 @@ def test_session_end_rules() -> None:
     assert ui.should_end_session("overview", 5, 5) is True
     assert ui.should_end_session("deckBrowser", 5, 5) is True
     assert ui.should_end_session("review", 5, None) is False
+
+
+class _Signal:
+    def __init__(self) -> None:
+        self.callbacks: list = []
+
+    def connect(self, callback) -> None:
+        self.callbacks.append(callback)
+
+
+class _FakeTimer:
+    """QTimer stand-in: start, stop, and isActive, with no Qt."""
+
+    def __init__(self) -> None:
+        self.timeout = _Signal()
+        self.destroyed = _Signal()
+        self.interval: int | None = None
+        self.active = False
+        self.starts = 0
+        self.stops = 0
+
+    def setInterval(self, interval_ms: int) -> None:
+        self.interval = interval_ms
+
+    def isActive(self) -> bool:
+        return self.active
+
+    def start(self) -> None:
+        self.active = True
+        self.starts += 1
+
+    def stop(self) -> None:
+        if self.active:
+            self.stops += 1
+        self.active = False
+
+
+class _FakeLabel:
+    def __init__(self) -> None:
+        self.text = ""
+        self.visible = False
+        self.destroyed = _Signal()
+
+    def setText(self, text: str) -> None:
+        self.text = text
+
+    def show(self) -> None:
+        self.visible = True
+
+    def hide(self) -> None:
+        self.visible = False
+
+
+class _DeletedLabel(_FakeLabel):
+    """A label whose C++ object is already gone."""
+
+    def setText(self, text: str) -> None:
+        raise RuntimeError("wrapped C/C++ object has been deleted")
+
+    def hide(self) -> None:
+        raise RuntimeError("wrapped C/C++ object has been deleted")
+
+
+def _save_chrome():
+    return (
+        ui._stats_label,
+        ui._elapsed_timer,
+        ui._active.stats,
+        ui._active.filtered_id,
+        ui._active.source_id,
+    )
+
+
+def _restore_chrome(saved) -> None:
+    (
+        ui._stats_label,
+        ui._elapsed_timer,
+        ui._active.stats,
+        ui._active.filtered_id,
+        ui._active.source_id,
+    ) = saved
+
+
+def test_running_stats_tick_text_moves_the_clock_only() -> None:
+    from anki_free_review.tracking import begin_session_tracking
+
+    stats = begin_session_tracking(True, now=100)
+    assert stats is not None
+    stats.record_answer(7, 1)
+    seen = set(stats.seen_card_ids)
+
+    assert (
+        ui.running_stats_tick_text(
+            stats, now=100, reviewing=True, in_tracked_deck=True
+        )
+        == "Free Review: Answered 1 · Solid 0 · Struggle 1 · 0:00"
+    )
+    assert (
+        ui.running_stats_tick_text(
+            stats, now=161, reviewing=True, in_tracked_deck=True
+        )
+        == "Free Review: Answered 1 · Solid 0 · Struggle 1 · 1:01"
+    )
+    assert stats.answered == 1
+    assert stats.solid == 0
+    assert stats.struggle == 1
+    assert stats.seen_card_ids == seen
+    assert stats.struggle_card_ids == {7}
+
+    assert (
+        ui.running_stats_tick_text(None, now=161, reviewing=True, in_tracked_deck=True)
+        is None
+    )
+    assert (
+        ui.running_stats_tick_text(
+            stats, now=161, reviewing=False, in_tracked_deck=True
+        )
+        is None
+    )
+    assert (
+        ui.running_stats_tick_text(
+            stats, now=161, reviewing=True, in_tracked_deck=False
+        )
+        is None
+    )
+
+    stats.freeze(now=130)
+    assert (
+        ui.running_stats_tick_text(
+            stats, now=999, reviewing=True, in_tracked_deck=True
+        )
+        == "Free Review: Answered 1 · Solid 0 · Struggle 1 · 0:30"
+    )
+
+
+def test_elapsed_timer_starts_once_while_chrome_is_shown_and_stops_when_hidden() -> None:
+    saved = _save_chrome()
+    try:
+        timer = _FakeTimer()
+        label = _FakeLabel()
+        ui._install_elapsed_timer(timer)
+        ui._stats_label = label
+
+        assert timer.interval == ui.ELAPSED_TICK_MS == 1000
+        assert timer.timeout.callbacks == [ui._on_elapsed_tick]
+
+        ui._show_stats_label("Free Review: Answered 0 · Solid 0 · Struggle 0 · 0:00")
+        # A later card show refreshes counts but must not restart the interval.
+        ui._show_stats_label("Free Review: Answered 1 · Solid 1 · Struggle 0 · 0:04")
+        assert timer.starts == 1
+        assert timer.active
+        assert label.visible
+        assert label.text.endswith("0:04")
+
+        ui._hide_stats_label()
+        assert timer.stops == 1
+        assert not timer.active
+        assert not label.visible
+        assert label.text == ""
+
+        ui._hide_stats_label()
+        assert timer.stops == 1
+
+        ui._show_stats_label("Free Review: Answered 1 · Solid 1 · Struggle 0 · 0:05")
+        assert timer.starts == 2
+        assert timer.active
+    finally:
+        _restore_chrome(saved)
+
+
+def test_elapsed_tick_rewrites_the_clock_and_stops_when_the_session_ends() -> None:
+    from anki_free_review.tracking import begin_session_tracking
+
+    saved = _save_chrome()
+    try:
+        stats = begin_session_tracking(True, now=0)
+        assert stats is not None
+        stats.record_answer(4, 3)
+        ui._active.stats = stats
+        label = _FakeLabel()
+        label.show()
+        timer = _FakeTimer()
+        ui._install_elapsed_timer(timer)
+        timer.start()
+        ui._stats_label = label
+
+        text = ui._apply_elapsed_tick(reviewing=True, in_tracked_deck=True, now=1)
+        assert text == "Free Review: Answered 1 · Solid 1 · Struggle 0 · 0:01"
+        text = ui._apply_elapsed_tick(reviewing=True, in_tracked_deck=True, now=2)
+        assert text == "Free Review: Answered 1 · Solid 1 · Struggle 0 · 0:02"
+        assert label.text == text
+        assert stats.answered == 1
+        assert stats.solid == 1
+        assert stats.struggle == 0
+        assert stats.seen_card_ids == {4}
+        assert stats.struggle_card_ids == set()
+        assert timer.active
+        assert timer.starts == 1
+
+        # Left the practice deck: hide the line and stop. The tally stays until
+        # the session actually ends, so the next card show can bring it back.
+        assert (
+            ui._apply_elapsed_tick(reviewing=True, in_tracked_deck=False, now=6)
+            is None
+        )
+        assert not timer.active
+        assert label.text == ""
+        assert not label.visible
+        assert ui._active.stats is stats
+        assert stats.answered == 1
+
+        # Sync drops the tally, then hides, before the state change.
+        label.show()
+        label.setText("still up")
+        timer.start()
+        ui._active.stats = None
+        ui._hide_stats_label()
+        assert not timer.active
+        assert label.text == ""
+
+        # Leave, summary, and quit all go through finish, which freezes and stops.
+        ui._active.stats = stats
+        ui._active.filtered_id = 9
+        ui._active.source_id = 3
+        label.show()
+        timer.start()
+        finished, source_id = ui._finish_active_tracking()
+        assert finished is stats
+        assert source_id == 3
+        assert stats.ended_at is not None
+        assert ui._active.stats is None
+        assert ui._active.filtered_id is None
+        assert not timer.active
+        assert label.text == ""
+        assert not label.visible
+    finally:
+        _restore_chrome(saved)
+
+
+def test_tearing_down_the_stats_label_stops_the_timer() -> None:
+    saved = _save_chrome()
+    try:
+        label = _FakeLabel()
+        timer = _FakeTimer()
+        ui._stats_label = label
+        ui._install_elapsed_timer(timer)
+        timer.start()
+        ui._watch_stats_label(label)
+
+        assert len(label.destroyed.callbacks) == 1
+        label.destroyed.callbacks[0]()
+        assert ui._stats_label is None
+        assert not timer.active
+        assert timer.stops == 1
+
+        # A tick that finds the label already deleted drops it and stops.
+        dead = _DeletedLabel()
+        dead.show()
+        stats_timer = _FakeTimer()
+        ui._install_elapsed_timer(stats_timer)
+        stats_timer.start()
+        ui._stats_label = dead
+        from anki_free_review.tracking import begin_session_tracking
+
+        ui._active.stats = begin_session_tracking(True, now=0)
+        assert (
+            ui._apply_elapsed_tick(reviewing=True, in_tracked_deck=True, now=3)
+            is None
+        )
+        assert ui._stats_label is None
+        assert not stats_timer.active
+        assert stats_timer.stops == 1
+    finally:
+        _restore_chrome(saved)

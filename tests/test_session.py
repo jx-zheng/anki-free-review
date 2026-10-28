@@ -7,6 +7,7 @@ before the practice deck existed.
 
 from __future__ import annotations
 
+import json
 import os
 
 import anki.consts as C
@@ -20,19 +21,31 @@ from anki_free_review.session import (
     EMPTY_MESSAGE,
     FILTERED_SOURCE_MESSAGE,
     FREE_REVIEW_PREFIX,
+    NO_STRUGGLE_CARDS_MESSAGE,
     PREVIEW_AGAIN_SECS,
     PREVIEW_GOOD_SECS,
     PREVIEW_HARD_SECS,
     SCOPE_ALL_SEEN,
     SCOPE_OMIT_MATURE,
+    STRUGGLE_NAME_SUFFIX,
     V3_MESSAGE,
     cleanup_all_free_review_sessions,
     cleanup_free_review_deck,
+    is_free_review_deck,
     seen_card_search,
     snapshot_path,
     start_free_review,
     start_from_dialog_choice,
+    start_struggle_review,
+    struggle_card_search,
     take_snapshot_warnings,
+)
+from anki_free_review.tracking import (
+    begin_session_tracking,
+    format_running_stats,
+    format_summary_text,
+    should_show_summary,
+    struggle_browser_search,
 )
 
 
@@ -758,6 +771,179 @@ def test_preview_answer_does_not_bury_sibling(col) -> None:
     assert int(sibling.queue) == C.QUEUE_TYPE_NEW
     cleanup_free_review_deck(col, result.deck_id)
     assert int(col.get_card(second.id).queue) == C.QUEUE_TYPE_NEW
+
+
+def test_tracked_answers_match_stats_and_leave_scheduling_unchanged(col) -> None:
+    col.set_config("fsrs", True)
+    deck_id = col.decks.id("Practice")
+    again = _review(col, "again", deck_id, due=10, ivl=8, reps=3)
+    again.decay = 0.5
+    again.memory_state = FSRSMemoryState(stability=8, difficulty=6)
+    col.update_cards([again])
+    hard = _review(col, "hard", deck_id, due=11, ivl=6, reps=2)
+    good = _review(col, "good", deck_id, due=12, ivl=9, reps=4)
+    easy = _review(col, "easy", deck_id, due=13, ivl=14, reps=5)
+    bounce = _review(col, "bounce", deck_id, due=14, ivl=4, reps=2)
+    outsider = _review(col, "outsider", deck_id, due=15, ivl=3, reps=1)
+    cards = [again, hard, good, easy, bounce, outsider]
+    ids = [card.id for card in cards]
+    before = {cid: _grab(col, cid) for cid in ids}
+    states = {cid: _next_states(col, cid) for cid in ids}
+
+    assert begin_session_tracking(False) is None
+    assert should_show_summary(None) is False
+
+    result = start_free_review(col, deck_id)
+    assert result.ok, result.message
+    stats = begin_session_tracking(True, now=1_000.0)
+    assert stats is not None
+    sequence = [
+        (again, 1),
+        (hard, 2),
+        (good, 3),
+        (easy, 4),
+        (bounce, 1),
+        (bounce, 3),
+    ]
+    for card, ease in sequence:
+        stats.note_seen(card.id)
+        _answer(col, card.id, ease)
+        assert stats.record_answer(card.id, ease) in {"solid", "struggle"}
+    stats.note_seen(outsider.id)
+
+    assert stats.answered == 6
+    assert stats.solid == 3
+    assert stats.struggle == 3
+    assert stats.struggle_card_ids == {again.id, hard.id, bounce.id}
+    assert good.id not in stats.struggle_card_ids
+    assert easy.id not in stats.struggle_card_ids
+    assert outsider.id not in stats.struggle_card_ids
+    assert stats.seen_card_ids == set(ids)
+    stats.freeze(now=1_065.0)
+    summary = format_summary_text(stats)
+    assert "Time spent: 1:05" in summary
+    assert "Cards seen: 6" in summary
+    assert "Answered: 6" in summary
+    assert "Solid (Good or Easy): 3" in summary
+    assert "Struggle (Again or Hard): 3" in summary
+    assert "Success rate: 50% (solid / answered)" in summary
+    assert "Struggle cards: 3" in summary
+    assert format_running_stats(stats, now=9_999) == (
+        "Free Review: Answered 6 · Solid 3 · Struggle 3 · 1:05"
+    )
+
+    payload = json.loads(open(snapshot_path(col), encoding="utf-8").read())
+    assert set(payload) == {"version", "sessions"}
+    stored = next(iter(payload["sessions"].values()))
+    assert set(stored) == {"source_deck_id", "filtered_deck_id", "undo_id", "cards"}
+    assert "struggle" not in json.dumps(payload)
+
+    assert cleanup_free_review_deck(col, result.deck_id)
+    for cid in ids:
+        assert _grab(col, cid) == before[cid]
+        assert _next_states(col, cid) == states[cid]
+
+    revisit = start_struggle_review(col, deck_id, sorted(stats.struggle_card_ids))
+    assert revisit.ok, revisit.message
+    assert col.decks.name(revisit.deck_id) == f"Free Review - Practice{STRUGGLE_NAME_SUFFIX}"
+    config = col.sched.get_or_create_filtered_deck(revisit.deck_id).config
+    assert config.reschedule is False
+    assert is_free_review_deck(col, revisit.deck_id)
+    search = config.search_terms[0].search
+    assert "-is:new" in search and "-is:suspended" in search and "-is:buried" in search
+    gathered = set(col.find_cards(f"did:{revisit.deck_id}"))
+    assert gathered == {again.id, hard.id, bounce.id}
+    for cid in gathered:
+        card = col.get_card(cid)
+        assert int(card.did) == int(revisit.deck_id)
+        assert int(card.odid) == int(deck_id)
+    _answer(col, again.id, 1)
+    _answer(col, hard.id, 2)
+    _answer(col, bounce.id, 3)
+    assert cleanup_free_review_deck(col, revisit.deck_id)
+    for cid in ids:
+        assert _grab(col, cid) == before[cid], col.get_card(cid).note()["Front"]
+        assert _next_states(col, cid) == states[cid]
+        if cid != outsider.id:
+            assert {row[3] for row in _revlog(col, cid)} == {C.REVLOG_CRAM}
+    assert not any(name.startswith(FREE_REVIEW_PREFIX) for name in _names(col))
+    browser = struggle_browser_search(stats.struggle_card_ids)
+    assert browser == "cid:" + ",".join(
+        str(cid) for cid in sorted(stats.struggle_card_ids)
+    )
+    assert set(col.find_cards(browser)) == stats.struggle_card_ids
+
+
+def test_tracking_off_writes_no_struggle_store(col) -> None:
+    deck_id = col.decks.id("Quiet")
+    card = _review(col, "q", deck_id, due=4, ivl=3, reps=1)
+    before = _grab(col, card.id)
+    result = start_free_review(col, deck_id)
+    assert result.ok
+    assert begin_session_tracking(False) is None
+    payload = json.loads(open(snapshot_path(col), encoding="utf-8").read())
+    assert set(payload) == {"version", "sessions"}
+    stored = next(iter(payload["sessions"].values()))
+    assert set(stored) == {"source_deck_id", "filtered_deck_id", "undo_id", "cards"}
+    assert "struggle" not in json.dumps(payload)
+    _answer(col, card.id, 3)
+    assert cleanup_free_review_deck(col, result.deck_id)
+    assert _grab(col, card.id) == before
+    assert should_show_summary(None) is False
+    assert not os.path.exists(snapshot_path(col))
+
+
+def test_empty_struggle_review_creates_nothing(col) -> None:
+    deck_id = col.decks.id("NoStruggle")
+    card = _review(col, "q", deck_id, due=4, ivl=3, reps=1)
+    before = _grab(col, card.id)
+    result = start_struggle_review(col, deck_id, [])
+    assert result.ok is False
+    assert result.message == NO_STRUGGLE_CARDS_MESSAGE
+    assert result.deck_id is None
+    assert _grab(col, card.id) == before
+    assert not os.path.exists(snapshot_path(col))
+    assert not any(name.startswith(FREE_REVIEW_PREFIX) for name in _names(col))
+
+
+def test_struggle_search_skips_new_and_suspended_cards(col) -> None:
+    deck_id = col.decks.id("Skip")
+    keep = _review(col, "keep", deck_id, due=6, ivl=5, reps=2)
+    new = _note(col, "new", deck_id)
+    suspended = _review(col, "suspended", deck_id, due=7, ivl=5, reps=2)
+    col.sched.suspend_cards([suspended.id])
+    search = struggle_card_search(col, [keep.id, new.id, suspended.id])
+    assert "-is:new" in search and "-is:suspended" in search and "-is:buried" in search
+    assert str(keep.id) in search
+    assert set(col.find_cards(search)) == {keep.id}
+
+    result = start_struggle_review(col, deck_id, [keep.id, new.id, suspended.id])
+    assert result.ok, result.message
+    assert set(col.find_cards(f"did:{result.deck_id}")) == {keep.id}
+    assert int(col.get_card(keep.id).odid) == int(deck_id)
+    browser = struggle_browser_search([suspended.id, keep.id])
+    assert set(col.find_cards(browser)) == {keep.id, suspended.id}
+    assert cleanup_free_review_deck(col, result.deck_id)
+    assert int(col.get_card(suspended.id).queue) == C.QUEUE_TYPE_SUSPENDED
+    assert int(col.get_card(keep.id).odid) == 0
+    assert int(col.get_card(new.id).queue) == C.QUEUE_TYPE_NEW
+
+
+def test_struggle_review_undo_does_not_resurrect_the_practice_deck(col) -> None:
+    deck_id = col.decks.id("UndoStruggle")
+    card = _review(col, "q", deck_id, due=0, ivl=4, reps=2)
+    result = start_struggle_review(col, deck_id, [card.id])
+    assert result.ok, result.message
+    _answer(col, card.id, 1)
+    assert int(col.get_card(card.id).due) != 0
+    assert cleanup_free_review_deck(col, result.deck_id)
+    assert int(col.get_card(card.id).due) == 0
+    assert int(col.get_card(card.id).reps) == 2
+    col.undo()
+    assert int(col.get_card(card.id).due) == 0
+    assert int(col.get_card(card.id).reps) == 2
+    assert int(col.get_card(card.id).ivl) == 4
+    assert not any(name.startswith(FREE_REVIEW_PREFIX) for name in _names(col))
 
 
 def _review(col, front: str, deck_id: int, *, due: int, ivl: int, reps: int):

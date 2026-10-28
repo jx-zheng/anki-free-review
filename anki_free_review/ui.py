@@ -72,6 +72,11 @@ class _ActiveSession:
 
 _active = _ActiveSession()
 _stats_label = None
+# One repeating timer for the running line's clock. It is started when that
+# line is shown and stopped when the line is hidden or destroyed. Show and
+# answer hooks still refresh the counts; this tick only rewrites the label.
+ELAPSED_TICK_MS = 1000
+_elapsed_timer = None
 
 
 def append_overview_button(links: list, *, deck_is_filtered: bool) -> None:
@@ -283,7 +288,9 @@ def _on_sync_will_start() -> None:
     if mw.state == "review" and _active.filtered_id:
         # Leaving review runs _on_state_change, which deletes the practice deck.
         # Drop the tally first so that path does not open a summary over the sync.
+        # Hide the running line now so its one-second clock cannot outlive the tally.
         _active.stats = None
+        _hide_stats_label()
         mw.moveToState("deckBrowser")
         return
     _sweep()
@@ -477,8 +484,30 @@ def _reviewing_active_deck() -> bool:
     return current == _active.filtered_id
 
 
+def running_stats_tick_text(
+    stats: SessionStats | None,
+    *,
+    now: float,
+    reviewing: bool,
+    in_tracked_deck: bool,
+) -> str | None:
+    """Text for one elapsed tick, or None when the running line should come down.
+
+    ``now`` only moves the clock. Answer counts are not changed here. None
+    means the caller should hide the line and stop the timer.
+    """
+
+    if stats is None or not reviewing or not in_tracked_deck:
+        return None
+    return format_running_stats(stats, now=now)
+
+
 def _refresh_stats_chrome(*, in_tracked_deck: bool) -> None:
-    """Update the running line. Called when a card is shown or answered."""
+    """Update counts on the running line when a card is shown or answered.
+
+    The elapsed clock has its own one-second timer. This path still rewrites
+    the whole line so solid and struggle change as soon as the answer lands.
+    """
 
     from aqt import mw
 
@@ -519,6 +548,7 @@ def _stats_label_widget():
     layout.insertWidget(index, label)
     label.hide()
     _stats_label = label
+    _watch_stats_label(label)
     return label
 
 
@@ -530,15 +560,166 @@ def _show_stats_label(text: str) -> None:
         return
     if label is None:
         return
-    label.setText(text)
-    label.show()
+    try:
+        label.setText(text)
+        label.show()
+    except RuntimeError:
+        _forget_stats_label(label)
+        return
+    try:
+        _start_elapsed_timer()
+    except Exception:
+        logger.debug("free-review elapsed timer could not start", exc_info=True)
 
 
 def _hide_stats_label() -> None:
-    if _stats_label is None:
+    """Hide the running line and stop its clock. Safe to call more than once."""
+
+    _stop_elapsed_timer()
+    label = _stats_label
+    if label is None:
         return
-    _stats_label.hide()
-    _stats_label.setText("")
+    try:
+        label.hide()
+        label.setText("")
+    except RuntimeError:
+        _forget_stats_label(label)
+
+
+def _watch_stats_label(label) -> None:
+    """Stop the clock if Anki destroys the label while a session is open."""
+
+    def dropped(*_args, watched=label) -> None:
+        _forget_stats_label(watched)
+
+    destroyed = getattr(label, "destroyed", None)
+    if destroyed is None or not hasattr(destroyed, "connect"):
+        return
+    try:
+        destroyed.connect(dropped)
+    except Exception:
+        logger.debug("free-review could not watch the stats label", exc_info=True)
+
+
+def _forget_stats_label(label) -> None:
+    """Drop a label that is gone, and do not leave its clock running."""
+
+    global _stats_label
+    if _stats_label is label:
+        _stats_label = None
+    _stop_elapsed_timer()
+
+
+def _install_elapsed_timer(timer) -> None:
+    """Use ``timer`` as the one-second clock. A test double can stand in for Qt."""
+
+    global _elapsed_timer
+    timer.setInterval(ELAPSED_TICK_MS)
+    timer.timeout.connect(_on_elapsed_tick)
+    _elapsed_timer = timer
+
+
+def _create_elapsed_timer():
+    from aqt import mw
+    from aqt.qt import QTimer
+
+    timer = QTimer(mw)
+    _install_elapsed_timer(timer)
+
+    def drop(*_args, watched=timer) -> None:
+        _clear_elapsed_timer(watched)
+
+    timer.destroyed.connect(drop)
+    return timer
+
+
+def _clear_elapsed_timer(timer) -> None:
+    global _elapsed_timer
+    if _elapsed_timer is timer:
+        _elapsed_timer = None
+
+
+def _start_elapsed_timer() -> None:
+    """Start the clock if it is not already running.
+
+    Calling start on a live QTimer restarts its interval. Card shows happen
+    faster than once a second, so an active timer is left on its own cadence.
+    """
+
+    timer = _elapsed_timer
+    if timer is None:
+        timer = _create_elapsed_timer()
+    if timer is None:
+        return
+    try:
+        if timer.isActive():
+            return
+        timer.start()
+    except RuntimeError:
+        _clear_elapsed_timer(timer)
+
+
+def _stop_elapsed_timer() -> None:
+    """Stop the clock. A second stop, or a timer Qt already deleted, is a no-op."""
+
+    timer = _elapsed_timer
+    if timer is None:
+        return
+    try:
+        if not timer.isActive():
+            return
+        timer.stop()
+    except RuntimeError:
+        _clear_elapsed_timer(timer)
+
+
+def _on_elapsed_tick() -> None:
+    """Rewrite the running line's clock.
+
+    Does not record a shown card or an answer, and does not touch scheduling.
+    """
+
+    try:
+        reviewing, in_deck = _elapsed_tick_context()
+        _apply_elapsed_tick(reviewing=reviewing, in_tracked_deck=in_deck)
+    except Exception:
+        logger.exception("free-review elapsed tick failed")
+        _stop_elapsed_timer()
+
+
+def _elapsed_tick_context() -> tuple[bool, bool]:
+    from aqt import mw
+
+    return mw.state == "review", _reviewing_active_deck()
+
+
+def _apply_elapsed_tick(
+    *, reviewing: bool, in_tracked_deck: bool, now: float | None = None
+) -> str | None:
+    """Set the running line from ``now``. Returns that text, or None if it came down.
+
+    Counts stay as they are. None hides the line and stops the timer, so a tick
+    that finds the session no longer on screen does not keep the clock running.
+    """
+
+    if now is None:
+        now = time.monotonic()
+    text = running_stats_tick_text(
+        _active.stats,
+        now=now,
+        reviewing=reviewing,
+        in_tracked_deck=in_tracked_deck,
+    )
+    label = _stats_label
+    if text is None or label is None:
+        _hide_stats_label()
+        return None
+    try:
+        label.setText(text)
+    except RuntimeError:
+        _forget_stats_label(label)
+        return None
+    return text
 
 
 def _finish_active_tracking() -> tuple[SessionStats | None, int | None]:

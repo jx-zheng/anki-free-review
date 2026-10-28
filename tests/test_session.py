@@ -23,12 +23,15 @@ from anki_free_review.session import (
     PREVIEW_AGAIN_SECS,
     PREVIEW_GOOD_SECS,
     PREVIEW_HARD_SECS,
+    SCOPE_ALL_SEEN,
+    SCOPE_OMIT_MATURE,
     V3_MESSAGE,
     cleanup_all_free_review_sessions,
     cleanup_free_review_deck,
     seen_card_search,
     snapshot_path,
     start_free_review,
+    start_from_dialog_choice,
     take_snapshot_warnings,
 )
 
@@ -675,6 +678,62 @@ def test_corrupt_restore_file_is_kept_and_warned(col) -> None:
     assert "restore file" in refused.message
     assert int(col.get_card(card.id).due) == 4
     assert not any(name.startswith(FREE_REVIEW_PREFIX) for name in _names(col))
+
+
+def test_omit_mature_search_and_session_leave_scheduling_unchanged(col) -> None:
+    deck_id = col.decks.id("Young")
+    learning = _review(col, "learn", deck_id, due=1, ivl=0, reps=1)
+    learning.type = C.CARD_TYPE_LRN
+    learning.queue = C.QUEUE_TYPE_DAY_LEARN_RELEARN
+    learning.left = 1001
+    col.update_cards([learning])
+    young = _review(col, "young", deck_id, due=2, ivl=20, reps=2)
+    boundary = _review(col, "mature", deck_id, due=3, ivl=21, reps=4)
+    older = _review(col, "older", deck_id, due=4, ivl=40, reps=6)
+    ids = [learning.id, young.id, boundary.id, older.id]
+    before = {cid: _grab(col, cid) for cid in ids}
+
+    all_seen = set(col.find_cards(seen_card_search(col, "Young")))
+    omitted = set(
+        col.find_cards(seen_card_search(col, "Young", omit_mature=True))
+    )
+    assert {learning.id, young.id, boundary.id, older.id} <= all_seen
+    assert omitted == {learning.id, young.id}
+    assert "-prop:ivl>=21" in seen_card_search(col, "Young", omit_mature=True)
+
+    result = start_free_review(col, deck_id, scope=SCOPE_OMIT_MATURE)
+    assert result.ok, result.message
+    gathered = set(col.find_cards(f"did:{result.deck_id}"))
+    assert gathered == {learning.id, young.id}
+    _answer(col, learning.id, 3)
+    _answer(col, young.id, 1)
+    assert cleanup_free_review_deck(col, result.deck_id)
+    for cid in ids:
+        assert _grab(col, cid) == before[cid]
+    assert not any(name.startswith(FREE_REVIEW_PREFIX) for name in _names(col))
+
+
+def test_omit_mature_with_only_mature_cards_creates_nothing(col) -> None:
+    deck_id = col.decks.id("MatureOnly")
+    _review(col, "m", deck_id, due=8, ivl=21, reps=3)
+    empty = start_free_review(col, deck_id, scope=SCOPE_OMIT_MATURE)
+    assert empty.ok is False
+    assert empty.message == EMPTY_MESSAGE
+    assert empty.deck_id is None
+    assert not os.path.exists(snapshot_path(col))
+    assert col.decks.id_for_name("Free Review - MatureOnly") is None
+
+
+def test_cancel_dialog_creates_nothing(col) -> None:
+    deck_id = col.decks.id("Cancel")
+    card = _review(col, "q", deck_id, due=5, ivl=30, reps=2)
+    before = _grab(col, card.id)
+    result = start_from_dialog_choice(col, deck_id, None)
+    assert result is None
+    assert _grab(col, card.id) == before
+    assert not any(name.startswith(FREE_REVIEW_PREFIX) for name in _names(col))
+    assert not os.path.exists(snapshot_path(col))
+    assert start_from_dialog_choice(col, deck_id, SCOPE_ALL_SEEN).ok
 
 
 def test_preview_answer_does_not_bury_sibling(col) -> None:

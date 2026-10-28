@@ -8,11 +8,16 @@ from __future__ import annotations
 
 from .session import (
     EMPTY_MESSAGE,
+    SCOPE_ALL_SEEN,
+    SCOPE_OMIT_MATURE,
     cleanup_all_free_review_sessions,
     cleanup_free_review_deck,
-    start_free_review,
+    start_from_dialog_choice,
     take_snapshot_warnings,
 )
+
+CHOICE_ALL_SEEN = "All seen cards"
+CHOICE_OMIT_MATURE = "Omit mature cards"
 
 FREE_REVIEW_URL = "freeReview"
 FREE_REVIEW_LABEL = "Free Review"
@@ -43,6 +48,53 @@ def handle_overview_url(url: str, fallback, on_free_review) -> bool:
         return True
     result = fallback(url)
     return bool(result)
+
+
+def free_review_scope_or_cancel(accepted: bool, omit_mature: bool) -> str | None:
+    """Map the dialog result to a session scope. Cancel returns None."""
+
+    if not accepted:
+        return None
+    return SCOPE_OMIT_MATURE if omit_mature else SCOPE_ALL_SEEN
+
+
+def ask_free_review_scope(parent) -> str | None:
+    """Ask which seen cards to practice. Cancel returns None and builds nothing."""
+
+    from aqt.qt import (
+        QDialog,
+        QDialogButtonBox,
+        QLabel,
+        QRadioButton,
+        Qt,
+        QVBoxLayout,
+    )
+    from aqt.utils import qconnect
+
+    dialog = QDialog(parent)
+    dialog.setWindowTitle("Free Review")
+    dialog.setWindowModality(Qt.WindowModality.WindowModal)
+    layout = QVBoxLayout(dialog)
+    layout.addWidget(QLabel("Which cards do you want to practice?"))
+    all_seen = QRadioButton(CHOICE_ALL_SEEN)
+    omit = QRadioButton(CHOICE_OMIT_MATURE)
+    all_seen.setChecked(True)
+    note = QLabel(
+        "Mature cards have an interval of 21 days or more. "
+        "New, suspended, and buried cards are always skipped."
+    )
+    note.setWordWrap(True)
+    layout.addWidget(all_seen)
+    layout.addWidget(omit)
+    layout.addWidget(note)
+    buttons = QDialogButtonBox(
+        QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+    )
+    qconnect(buttons.accepted, dialog.accept)
+    qconnect(buttons.rejected, dialog.reject)
+    layout.addWidget(buttons)
+    accepted = dialog.exec() == QDialog.DialogCode.Accepted
+    return free_review_scope_or_cancel(accepted, omit.isChecked())
 
 
 def should_end_session(
@@ -199,10 +251,16 @@ def _start(deck_id: int) -> None:
     from aqt.operations import CollectionOp
     from aqt.utils import tooltip
 
+    scope = ask_free_review_scope(mw)
+    if scope is None:
+        return
+
     def op(col):
-        return start_free_review(col, deck_id)
+        return start_from_dialog_choice(col, deck_id, scope)
 
     def success(result) -> None:
+        if result is None:
+            return
         if not result.ok or not result.deck_id:
             tooltip(result.message or EMPTY_MESSAGE, parent=mw)
             return

@@ -5,6 +5,10 @@ mechanism as Custom Study when "Reschedule cards based on my answers in
 this deck" is unchecked. Answering uses preview scheduling. The revlog
 row is type cram (filtered), which FSRS does not treat as a review.
 
+A struggle revisit is the same kind of deck, limited to card ids. Anki still
+sets ``odid`` to the home deck while the card sits in the practice deck.
+Struggle totals are not written into this restore file.
+
 Two Anki preview side effects are patched after the temporary deck is
 removed. Nothing else on the card is written back:
 
@@ -26,6 +30,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 
 from anki.cards import FSRSMemoryState
@@ -37,6 +42,7 @@ from anki.scheduler import FilteredDeckForUpdate
 logger = logging.getLogger(__name__)
 
 FREE_REVIEW_PREFIX = "Free Review - "
+STRUGGLE_NAME_SUFFIX = " (struggle)"
 # Anki custom study uses these preview delays when reschedule is off.
 # Again/Hard show the card again inside this session only; Good returns
 # it. Easy always returns the card (there is no preview-easy delay).
@@ -46,6 +52,7 @@ PREVIEW_GOOD_SECS = 0
 PREVIEW_DELAY_SECS = 10
 
 EMPTY_MESSAGE = "No seen cards to practice in this deck."
+NO_STRUGGLE_CARDS_MESSAGE = "No struggle cards to practice."
 NONE_MOVABLE_MESSAGE = (
     "No seen cards can be practiced right now. Suspended cards, buried "
     "cards, and cards already in another filtered deck are skipped."
@@ -168,16 +175,10 @@ def start_free_review(
     nothing to practice.
     """
 
-    if not col.v3_scheduler():
-        return _fail(V3_MESSAGE)
-
     source_deck_id = int(source_deck_id)
-    if not col.decks.have(DeckId(source_deck_id)):
-        return _fail(MISSING_DECK_MESSAGE)
-    if col.decks.is_filtered(DeckId(source_deck_id)):
-        return _fail(FILTERED_SOURCE_MESSAGE)
-    if not _load_store(col).trusted:
-        return _fail(SNAPSHOT_CORRUPT_MESSAGE)
+    error = _source_error(col, source_deck_id)
+    if error:
+        return error
 
     # Finish any previous practice deck before snapshotting, so a crashed
     # session cannot be captured as the new baseline.
@@ -190,9 +191,122 @@ def start_free_review(
         return _fail(EMPTY_MESSAGE)
 
     filtered_name = _allocate_filtered_name(col, deck_name)
-    snapshots = {
-        int(cid): _snapshot_card(col.get_card(cid)) for cid in card_ids
-    }
+    return _open_preview_deck(col, source_deck_id, filtered_name, search, card_ids)
+
+
+def start_struggle_review(
+    col: Collection, source_deck_id: int, card_ids: Iterable[int]
+) -> StartResult:
+    """Open a preview filtered deck containing these card ids.
+
+    ``reschedule`` is false, the same path as Free Review. Anki sets
+    ``odid`` to each card's home deck while it is in the practice deck, so a
+    home/``odid`` allowlist in another add-on still sees these cards.
+    Suspended, buried, and new cards are not gathered. An empty id list does
+    not create a deck.
+    """
+
+    source_deck_id = int(source_deck_id)
+    error = _source_error(col, source_deck_id)
+    if error:
+        return error
+    ids = sorted({int(cid) for cid in card_ids})
+    if not ids:
+        return _fail(NO_STRUGGLE_CARDS_MESSAGE)
+
+    cleanup_all_free_review_sessions(col)
+    search = struggle_card_search(col, ids)
+    matched = list(col.find_cards(search))
+    if not matched:
+        return _fail(NO_STRUGGLE_CARDS_MESSAGE)
+    deck_name = col.decks.name(DeckId(source_deck_id))
+    filtered_name = _allocate_filtered_name(col, deck_name, suffix=STRUGGLE_NAME_SUFFIX)
+    return _open_preview_deck(col, source_deck_id, filtered_name, search, matched)
+
+
+def struggle_card_search(col: Collection, card_ids: Iterable[int]) -> str:
+    """Search that gathers these ids and still looks like a Free Review deck.
+
+    The ``-is:new`` / ``-is:suspended`` / ``-is:buried`` markers are what
+    cleanup uses to recognize the practice deck. They also match the cards
+    a filtered deck is able to hold.
+    """
+
+    ids = sorted({int(cid) for cid in card_ids})
+    if not ids:
+        raise ValueError("struggle search needs at least one card id")
+    id_search = "cid:" + ",".join(str(cid) for cid in ids)
+    return col.build_search_string(
+        id_search,
+        SearchNode(negated=SearchNode(card_state=SearchNode.CARD_STATE_NEW)),
+        SearchNode(negated=SearchNode(card_state=SearchNode.CARD_STATE_SUSPENDED)),
+        SearchNode(negated=SearchNode(card_state=SearchNode.CARD_STATE_BURIED)),
+    )
+
+
+def cleanup_free_review_deck(col: Collection, deck_id: int) -> bool:
+    """Return cards home, delete one practice deck we recorded, and patch side effects."""
+
+    deck_id = int(deck_id)
+    data = _load_store(col)
+    if not data.trusted:
+        return False
+    keys = [
+        key
+        for key, session in data.sessions.items()
+        if session.get("filtered_deck_id") == deck_id or key == _deck_name_or_none(col, deck_id)
+    ]
+    if not keys:
+        return False
+    _finish_sessions(col, data, keys)
+    return True
+
+
+def cleanup_all_free_review_sessions(col: Collection) -> int:
+    """Remove practice decks recorded in the restore file and patch side effects.
+
+    A filtered deck is removed only when its id (or, if the id was not saved
+    yet, its exact name) is in that file. A user deck that happens to use the
+    same name and search is left alone.
+
+    Cards that have since received a real review (reps, interval, ease,
+    lapses, or type changed) are left alone. Suspend, bury, and deck moves
+    are also left alone.
+    """
+
+    data = _load_store(col)
+    if not data.trusted:
+        return 0
+    if not data.sessions:
+        return 0
+    return _finish_sessions(col, data, list(data.sessions))
+
+
+def is_free_review_deck(col: Collection, deck_id: int) -> bool:
+    return _is_our_deck(col, int(deck_id))
+
+
+def _source_error(col: Collection, source_deck_id: int) -> StartResult | None:
+    if not col.v3_scheduler():
+        return _fail(V3_MESSAGE)
+    deck_id = DeckId(int(source_deck_id))
+    if not col.decks.have(deck_id):
+        return _fail(MISSING_DECK_MESSAGE)
+    if col.decks.is_filtered(deck_id):
+        return _fail(FILTERED_SOURCE_MESSAGE)
+    if not _load_store(col).trusted:
+        return _fail(SNAPSHOT_CORRUPT_MESSAGE)
+    return None
+
+
+def _open_preview_deck(
+    col: Collection,
+    source_deck_id: int,
+    filtered_name: str,
+    search: str,
+    card_ids: list[int],
+) -> StartResult:
+    snapshots = {int(cid): _snapshot_card(col.get_card(cid)) for cid in card_ids}
     # Recorded before the build so cleanup can merge the build, the
     # answers, and the removal into one undo step.
     undo_id = int(col.add_custom_undo_entry("Free Review"))
@@ -258,48 +372,6 @@ def start_free_review(
     )
 
 
-def cleanup_free_review_deck(col: Collection, deck_id: int) -> bool:
-    """Return cards home, delete one practice deck we recorded, and patch side effects."""
-
-    deck_id = int(deck_id)
-    data = _load_store(col)
-    if not data.trusted:
-        return False
-    keys = [
-        key
-        for key, session in data.sessions.items()
-        if session.get("filtered_deck_id") == deck_id or key == _deck_name_or_none(col, deck_id)
-    ]
-    if not keys:
-        return False
-    _finish_sessions(col, data, keys)
-    return True
-
-
-def cleanup_all_free_review_sessions(col: Collection) -> int:
-    """Remove practice decks recorded in the restore file and patch side effects.
-
-    A filtered deck is removed only when its id (or, if the id was not saved
-    yet, its exact name) is in that file. A user deck that happens to use the
-    same name and search is left alone.
-
-    Cards that have since received a real review (reps, interval, ease,
-    lapses, or type changed) are left alone. Suspend, bury, and deck moves
-    are also left alone.
-    """
-
-    data = _load_store(col)
-    if not data.trusted:
-        return 0
-    if not data.sessions:
-        return 0
-    return _finish_sessions(col, data, list(data.sessions))
-
-
-def is_free_review_deck(col: Collection, deck_id: int) -> bool:
-    return _is_our_deck(col, int(deck_id))
-
-
 def _omit_mature(scope: str) -> bool:
     if scope == SCOPE_ALL_SEEN:
         return False
@@ -328,14 +400,16 @@ def _display_deck_name(deck_name: str) -> str:
     return deck_name.replace("::", " / ")
 
 
-def _allocate_filtered_name(col: Collection, source_name: str) -> str:
+def _allocate_filtered_name(
+    col: Collection, source_name: str, *, suffix: str = ""
+) -> str:
     """Pick a deck name that is not already used.
 
     An existing filtered deck is never reused, even when its name and search
     look like one of ours. Only ids recorded in the restore file are deleted.
     """
 
-    base = f"{FREE_REVIEW_PREFIX}{_display_deck_name(source_name)}"
+    base = f"{FREE_REVIEW_PREFIX}{_display_deck_name(source_name)}{suffix}"
     for index in range(1, 50):
         name = base if index == 1 else f"{base} ({index})"
         if col.decks.id_for_name(name) is None:

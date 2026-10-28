@@ -1,6 +1,6 @@
 # Free Review
 
-Anki addon that starts a practice session of **every seen card** in a deck and its subdecks. New cards stay out. Again, Hard, Good, and Easy do not change due dates, intervals, ease, reps, or lapses.
+Anki addon that starts a practice session of **every seen card** in a deck and its subdecks. New cards stay out. Again, Hard, Good, and Easy do not change due dates, intervals, ease, reps, or lapses. Optional struggle tracking is off until you turn it on.
 
 This is the same idea as Custom Study / a filtered deck with **Reschedule cards based on my answers in this deck** turned off.
 
@@ -10,6 +10,7 @@ On the deck overview, click **Free Review** (shortcut **F**). Or open the gear m
 
 - **All seen cards** — learning, young, and mature.
 - **Omit mature cards** — learning and young only.
+- **Track struggle and session stats** — off by default. Anki remembers the last choice (`track_struggle` in the add-on config). Leave it off and Free Review ends the way it always has: no running total and no summary.
 
 A card is mature when its interval is **at least 21 days** (`prop:ivl>=21`). That is the cutoff Anki's browser uses. Anki 25.9.2 has no `is:mature` search term. Learning cards usually have an interval of 0, so they stay. A relearning card keeps its previous interval, so a lapsed mature card is omitted too.
 
@@ -29,6 +30,40 @@ Cards are ordered at random. Again shows the card again after 1 minute and Hard 
 If the deck has no matching cards (nothing seen, or only mature cards when those are omitted), Anki shows "No seen cards to practice in this deck." and does not create a deck.
 
 When you leave the reviewer (finish, Back, Decks), quit, or sync, the temporary deck is deleted and cards are back in the original decks. The same cleanup runs on profile open, before automatic sync, so a crash does not leave `Free Review - ...` decks behind or upload them.
+
+## Struggle tracking
+
+Turn on **Track struggle and session stats** in the Free Review dialog when you want a tally for that run. The checkbox starts off. The last choice is saved in the add-on config, so the next dialog opens the way you left it. Cancel does not change the saved choice.
+
+While the session is open, a line between the card and the answer buttons shows:
+
+`Free Review: Answered 4 · Solid 3 · Struggle 1 · 1:05`
+
+- **Answered** counts every Again, Hard, Good, and Easy press. One card can add more than one.
+- **Solid** is Good or Easy.
+- **Struggle** is Again or Hard.
+- The clock is time since this session started, not Anki's per-card timer on the More button.
+
+**Cards seen** (in the summary) is the number of distinct cards shown or answered.
+
+**Struggle cards** follow one rule: the first Again or Hard puts that card on the list for the rest of the session, including the summary. A later Good or Easy does not take it off. The list is the cards you had to come back to, not whichever button you pressed last.
+
+The totals stay in memory for that run. They are not written into the restore file, and they do not change undo, cleanup, or scheduling. Undo during the session puts the card back, but it does not rewind the tally. The summary counts the buttons you pressed.
+
+When you leave the reviewer, a **Free Review summary** dialog shows:
+
+- time spent
+- cards seen
+- answered, solid, and struggle
+- success rate, which is solid answers ÷ answered (`n/a` when you did not answer)
+- how many struggle cards, and the rule above
+
+**Close** dismisses it. If any card was struggled, two more buttons are there:
+
+- **Review struggle cards** starts another Free Review filtered deck of those card ids only, with struggle tracking still on. `reschedule` is still false, so due dates, intervals, ease, reps, and lapses stay put. The deck is named `Free Review - <deck> (struggle)`. Cards still move through Anki's filtered deck, with `odid` set to the home deck for the length of that session. Suspended, buried, and new cards are skipped, same as a normal Free Review. If none of the struggle cards can be gathered, Anki shows "No struggle cards to practice." and does not create a deck.
+- **Show in Browser** opens the card browser on `cid:…` for every struggle id, including cards the filtered deck cannot gather. That button leaves the summary open, so you can still review them afterward.
+
+Quit and sync still delete the practice deck. They do not open the summary, because a dialog there would block shutdown or sync. With tracking off, leaving the reviewer does not open a summary either.
 
 ## Scheduling and AnkiWeb
 
@@ -52,7 +87,7 @@ On Anki 25.9.2, answering in this preview deck did **not** sibling-bury the othe
 
 While the session is still open, Undo is one step named Free Review: build, answers, removal, and the due/decay patch. Undoing it returns to the moment before Free Review. It does not leave the temporary deck behind or a timestamp in `due`. If Anki was killed mid-session, the cleanup on next launch is a new undo step, because the old undo stack is gone. Undoing that step can bring the practice deck back; don't undo it, or restart so cleanup can run again.
 
-The addon does not call a rescheduling answer path and does not set `reschedule` to true.
+The addon does not call a rescheduling answer path and does not set `reschedule` to true. Struggle tracking only counts answers. It does not write card fields, and the struggle revisit deck uses this same preview path.
 
 ## Anki versions
 
@@ -64,7 +99,7 @@ From a file. Anki reads `manifest.json` from the **root** of the zip and extract
 
 ```bash
 cd anki_free_review
-zip -r ../free-review.ankiaddon manifest.json __init__.py session.py ui.py
+zip -r ../free-review.ankiaddon manifest.json __init__.py session.py tracking.py ui.py config.json
 ```
 
 In Anki: **Tools → Add-ons → Install from file…** and choose `free-review.ankiaddon`. Restart Anki. Requires Anki 25.9.2 or newer (`min_point_version` 250902).
@@ -79,7 +114,7 @@ ln -s "$PWD/anki_free_review" ~/Library/Application Support/Anki2/addons21/anki_
 ln -s "$PWD/anki_free_review" ~/.local/share/Anki2/addons21/anki_free_review
 ```
 
-No config is required.
+No config is required. **Track struggle and session stats** stays off until you turn it on. Anki then remembers that checkbox in the add-on config (`track_struggle`). Tools → Add-ons → Free Review → Config edits the same value.
 
 ## Uninstall
 
@@ -98,7 +133,10 @@ python3 -m pytest
 The suite builds a temporary collection and does not touch a real profile. It checks:
 
 - Seen cards in a parent deck, subdeck, and grandchild are gathered; new, suspended, buried, and other-deck cards are not.
-- All seen cards include interval ≥ 21. Omit mature (`-prop:ivl>=21`) keeps learning and young cards (interval 20 and interval 0) and leaves mature cards out. Answers plus cleanup still do not change scheduling fields. A deck of only mature cards shows the empty message and creates no deck. Cancelling the dialog creates nothing.
+- All seen cards include interval ≥ 21. Omit mature (`-prop:ivl>=21`) keeps learning and young cards (interval 20 and interval 0) and leaves mature cards out. Answers plus cleanup still do not change scheduling fields. A deck of only mature cards shows the empty message and creates no deck. Cancelling the dialog creates nothing. The struggle-tracking checkbox is independent of All seen / Omit mature, and cancel does not change the saved checkbox.
+- Good and Easy count as solid. Again and Hard count as struggle. A card that gets Again or Hard stays in the struggle set after a later Good or Easy. Summary totals match that sequence. The running line is `Free Review: Answered N · Solid N · Struggle N · M:SS`.
+- A tracked session plus cleanup, and a follow-up struggle-card session plus cleanup, leave scheduling fields unchanged. While the struggle deck is open, `odid` is the home deck and `reschedule` is false. The restore file has no struggle store. The browser search is `cid:…`.
+- Tracking off does not create struggle totals and does not require a summary. An empty struggle-id list creates no deck. Suspended and new cards are left out of the struggle deck and still match the browser `cid:` search. Undo after a struggle session does not bring the practice deck back.
 - The filtered deck is created with `reschedule` false, and the current scheduling state is preview, not a rescheduling filter.
 - Again, Hard, Good, and Easy, including Again left in progress, leave due, interval, ease, reps, lapses, type, queue, odue, odid, deck id, FSRS stability/difficulty, decay, and the next intervals from `get_scheduling_states` unchanged. A due of 0 stays 0.
 - Suspend, bury, a browser deck move, and Set Due Date done during the session are still there after cleanup.

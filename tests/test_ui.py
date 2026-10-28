@@ -24,6 +24,8 @@ class _Hooks:
         self.profile_did_open = _Hook()
         self.profile_will_close = _Hook()
         self.sync_will_start = _Hook()
+        self.reviewer_did_answer_card = _Hook()
+        self.reviewer_did_show_question = _Hook()
 
 
 def test_package_imports_without_aqt() -> None:
@@ -43,6 +45,8 @@ def test_install_hooks_registers_each_entry_point() -> None:
     assert hooks.profile_did_open.callbacks == [ui._on_profile_did_open]
     assert hooks.profile_will_close.callbacks == [ui._on_profile_will_close]
     assert hooks.sync_will_start.callbacks == [ui._on_sync_will_start]
+    assert hooks.reviewer_did_answer_card.callbacks == [ui._on_reviewer_did_answer_card]
+    assert hooks.reviewer_did_show_question.callbacks == [ui._on_reviewer_did_show_question]
 
 
 def test_overview_button_is_hidden_on_filtered_decks() -> None:
@@ -75,6 +79,24 @@ def test_dialog_cancel_and_scope_mapping() -> None:
     assert ui.free_review_scope_or_cancel(False, False) is None
     assert ui.free_review_scope_or_cancel(True, False) == SCOPE_ALL_SEEN
     assert ui.free_review_scope_or_cancel(True, True) == SCOPE_OMIT_MATURE
+
+
+def test_dialog_tracking_is_independent_of_scope() -> None:
+    from anki_free_review.session import SCOPE_ALL_SEEN, SCOPE_OMIT_MATURE
+
+    omitted = ui.free_review_dialog_choice(True, True, True)
+    assert omitted is not None
+    assert omitted.scope == SCOPE_OMIT_MATURE
+    assert omitted.track_struggle is True
+    assert ui.tracking_to_persist(omitted) is True
+
+    all_seen = ui.free_review_dialog_choice(True, False, False)
+    assert all_seen is not None
+    assert all_seen.scope == SCOPE_ALL_SEEN
+    assert all_seen.track_struggle is False
+    assert ui.tracking_to_persist(all_seen) is False
+    assert ui.tracking_to_persist(None) is None
+    assert ui.free_review_dialog_choice(False, True, True) is None
 
 
 def test_session_end_rules() -> None:

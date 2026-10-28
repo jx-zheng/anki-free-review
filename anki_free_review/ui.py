@@ -11,6 +11,7 @@ from .session import (
     cleanup_all_free_review_sessions,
     cleanup_free_review_deck,
     start_free_review,
+    take_snapshot_warnings,
 )
 
 FREE_REVIEW_URL = "freeReview"
@@ -121,7 +122,11 @@ def _on_state_change(new_state: str, _old_state: str) -> None:
     source_id = _active.source_id
     _active.clear()
     if filtered_id:
+        # Synchronous on purpose: this must finish before a sync that the
+        # state change might be heading into. Undo is collapsed inside
+        # cleanup, so one Undo cannot bring the practice deck back by itself.
         cleanup_free_review_deck(mw.col, filtered_id)
+    _show_snapshot_warnings()
     _return_to_source_later(new_state, source_id)
 
 
@@ -170,6 +175,15 @@ def _sweep() -> None:
         return
     cleanup_all_free_review_sessions(mw.col)
     _active.clear()
+    _show_snapshot_warnings()
+
+
+def _show_snapshot_warnings() -> None:
+    from aqt import mw
+    from aqt.utils import tooltip
+
+    for message in take_snapshot_warnings():
+        tooltip(message, parent=mw)
 
 
 def _start_for_current_deck() -> None:

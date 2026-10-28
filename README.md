@@ -98,6 +98,7 @@ python3 -m pytest
 The suite builds a temporary collection and does not touch a real profile. It checks:
 
 - Seen cards in a parent deck, subdeck, and grandchild are gathered; new, suspended, buried, and other-deck cards are not.
+- All seen cards include interval ≥ 21. Omit mature (`-prop:ivl>=21`) keeps learning and young cards (interval 20 and interval 0) and leaves mature cards out. Answers plus cleanup still do not change scheduling fields. A deck of only mature cards shows the empty message and creates no deck. Cancelling the dialog creates nothing.
 - The filtered deck is created with `reschedule` false, and the current scheduling state is preview, not a rescheduling filter.
 - Again, Hard, Good, and Easy, including Again left in progress, leave due, interval, ease, reps, lapses, type, queue, odue, odid, deck id, FSRS stability/difficulty, decay, and the next intervals from `get_scheduling_states` unchanged. A due of 0 stays 0.
 - Suspend, bury, a browser deck move, and Set Due Date done during the session are still there after cleanup.

@@ -14,6 +14,8 @@ from anki.cards import FSRSMemoryState
 from anki.decks import FilteredDeckConfig
 from anki.scheduler import FilteredDeckForUpdate
 
+from anki.errors import UndoEmpty
+
 from anki_free_review.session import (
     EMPTY_MESSAGE,
     FILTERED_SOURCE_MESSAGE,
@@ -27,6 +29,7 @@ from anki_free_review.session import (
     seen_card_search,
     snapshot_path,
     start_free_review,
+    take_snapshot_warnings,
 )
 
 
@@ -582,21 +585,151 @@ def test_quoted_deck_names_and_nested_search(col) -> None:
     assert _grab(col, card.id) == before
 
 
+def test_suspend_bury_move_and_set_due_date_survive_cleanup(col) -> None:
+    col.set_config("fsrs", True)
+    home = col.decks.id("Home")
+    other = col.decks.id("OtherDeck")
+    suspended = _review(col, "suspend", home, due=20, ivl=8, reps=3)
+    buried = _review(col, "bury", home, due=21, ivl=8, reps=3)
+    moved = _review(col, "move", home, due=22, ivl=8, reps=3)
+    redated = _review(col, "redate", home, due=23, ivl=8, reps=3)
+    decayed = _review(col, "decay", home, due=0, ivl=4, reps=2)
+    decayed.decay = 0.5
+    col.update_cards([decayed])
+
+    result = start_free_review(col, home)
+    assert result.ok
+    _answer(col, suspended.id, 3)
+    _answer(col, buried.id, 3)
+    _answer(col, moved.id, 3)
+    _answer(col, redated.id, 3)
+    _answer(col, decayed.id, 1)
+    assert int(col.get_card(decayed.id).due) >= 1_000_000_000
+
+    col.sched.suspend_cards([suspended.id])
+    col.sched.bury_cards([buried.id], manual=True)
+    moved_card = col.get_card(moved.id)
+    moved_card.did = other
+    col.update_cards([moved_card])
+    col.sched.set_due_date([redated.id], "8")
+    redated_due = int(col.get_card(redated.id).due)
+
+    assert cleanup_free_review_deck(col, result.deck_id)
+    assert int(col.get_card(suspended.id).queue) == C.QUEUE_TYPE_SUSPENDED
+    assert int(col.get_card(buried.id).queue) == C.QUEUE_TYPE_MANUALLY_BURIED
+    assert int(col.get_card(moved.id).did) == int(other)
+    assert int(col.get_card(redated.id).due) == redated_due
+    assert int(col.get_card(decayed.id).due) == 0
+    assert col.get_card(decayed.id).decay == 0.5
+    assert not any(name.startswith(FREE_REVIEW_PREFIX) for name in _names(col))
+
+
+def test_undo_after_cleanup_does_not_resurrect_the_practice_deck(col) -> None:
+    deck_id = col.decks.id("Undo")
+    card = _review(col, "q", deck_id, due=0, ivl=4, reps=2)
+    result = start_free_review(col, deck_id)
+    _answer(col, card.id, 1)
+    assert cleanup_free_review_deck(col, result.deck_id)
+    assert int(col.get_card(card.id).due) == 0
+    assert not any(name.startswith(FREE_REVIEW_PREFIX) for name in _names(col))
+
+    col.undo()
+    assert int(col.get_card(card.id).due) == 0
+    assert int(col.get_card(card.id).reps) == 2
+    assert int(col.get_card(card.id).ivl) == 4
+    assert not any(name.startswith(FREE_REVIEW_PREFIX) for name in _names(col))
+    try:
+        col.undo()
+    except UndoEmpty:
+        pass
+
+
+def test_user_preview_deck_with_the_same_shape_is_not_deleted(col) -> None:
+    source = col.decks.id("Kept")
+    _review(col, "seen", source, due=9, ivl=4, reps=1)
+    user_search = "deck:Nobody -is:new -is:suspended -is:buried"
+    user_id = _user_filtered_deck(col, "Free Review - Kept", search=user_search, reschedule=False)
+    result = start_free_review(col, source)
+    assert result.ok
+    assert col.decks.name(result.deck_id) == "Free Review - Kept (2)"
+    removed = cleanup_all_free_review_sessions(col)
+    assert removed == 1
+    assert col.decks.have(user_id)
+    assert col.sched.get_or_create_filtered_deck(user_id).config.reschedule is False
+    assert col.decks.id_for_name("Free Review - Kept (2)") is None
+
+
+def test_corrupt_restore_file_is_kept_and_warned(col) -> None:
+    path = snapshot_path(col)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("{not json")
+    deck_id = col.decks.id("StillHere")
+    card = _review(col, "q", deck_id, due=4, ivl=3, reps=1)
+    assert cleanup_all_free_review_sessions(col) == 0
+    assert os.path.exists(path)
+    warnings = take_snapshot_warnings()
+    assert warnings
+    assert "restore file" in warnings[0]
+    refused = start_free_review(col, deck_id)
+    assert refused.ok is False
+    assert "restore file" in refused.message
+    assert int(col.get_card(card.id).due) == 4
+    assert not any(name.startswith(FREE_REVIEW_PREFIX) for name in _names(col))
+
+
+def test_preview_answer_does_not_bury_sibling(col) -> None:
+    deck_id = col.decks.id("Siblings")
+    model = col.models.by_name("Basic (and reversed card)")
+    note = col.new_note(model)
+    note["Front"] = "front"
+    note["Back"] = "back"
+    col.add_note(note, deck_id)
+    first, second = note.cards()
+    first.type = C.CARD_TYPE_REV
+    first.queue = C.QUEUE_TYPE_REV
+    first.due = 6
+    first.ivl = 5
+    first.factor = 2500
+    first.reps = 2
+    col.update_cards([first])
+    result = start_free_review(col, deck_id)
+    assert second.id not in set(col.find_cards(f"did:{result.deck_id}"))
+    _answer(col, first.id, 3)
+    sibling = col.get_card(second.id)
+    assert int(sibling.queue) == C.QUEUE_TYPE_NEW
+    cleanup_free_review_deck(col, result.deck_id)
+    assert int(col.get_card(second.id).queue) == C.QUEUE_TYPE_NEW
+
+
+def _review(col, front: str, deck_id: int, *, due: int, ivl: int, reps: int):
+    return _write(
+        col,
+        _note(col, front, deck_id),
+        type=C.CARD_TYPE_REV,
+        queue=C.QUEUE_TYPE_REV,
+        due=due,
+        ivl=ivl,
+        factor=2500,
+        reps=reps,
+        lapses=0,
+    )
+
+
 def _names(col) -> list[str]:
     return [item.name for item in col.decks.all_names_and_ids()]
 
 
-def _user_filtered_deck(col, name: str) -> int:
+def _user_filtered_deck(
+    col, name: str, *, search: str = "tag:__free_review_test_none__", reschedule: bool = True
+) -> int:
     out = col.sched.add_or_update_filtered_deck(
         FilteredDeckForUpdate(
             id=0,
             name=name,
             config=FilteredDeckConfig(
-                reschedule=True,
+                reschedule=reschedule,
                 search_terms=[
-                    FilteredDeckConfig.SearchTerm(
-                        search="tag:__free_review_test_none__", limit=5, order=0
-                    )
+                    FilteredDeckConfig.SearchTerm(search=search, limit=5, order=0)
                 ],
             ),
             allow_empty=True,

@@ -108,7 +108,7 @@ From a checkout, symlink the addon folder into Anki's add-on directory (then res
 
 ```bash
 # macOS
-ln -s "$PWD/anki_free_review" ~/Library/Application Support/Anki2/addons21/anki_free_review
+ln -s "$PWD/anki_free_review" "$HOME/Library/Application Support/Anki2/addons21/anki_free_review"
 
 # Linux
 ln -s "$PWD/anki_free_review" ~/.local/share/Anki2/addons21/anki_free_review
@@ -149,3 +149,7 @@ The suite builds a temporary collection and does not touch a real profile. It ch
 - A user deck already named `Free Review - ...` is not deleted or overwritten.
 - A snapshot is not applied to a card that has since had a real review.
 - A normal Good answer (the control) does change reps and the interval, so the comparisons above are not vacuous.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

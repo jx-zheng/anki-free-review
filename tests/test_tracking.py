@@ -181,7 +181,6 @@ def _tally(stats) -> tuple:
 def test_undo_then_redo_restores_one_answer() -> None:
     stats = begin_session_tracking(True, now=50)
     assert stats is not None
-    before = _tally(stats)
     assert (
         accept_review_answer(
             stats, in_tracked_deck=True, card_id=4, ease=3, undo_step=10
@@ -199,7 +198,8 @@ def test_undo_then_redo_restores_one_answer() -> None:
     assert _tally(stats) == after
 
     assert undo_review_answer(stats, undone_step=10, redo_step=11) is True
-    assert _tally(stats) == before
+    # Counts and the struggle set match the pre-answer tally. The card stays seen.
+    assert _tally(stats) == (0, 0, 0, {4}, set())
     assert format_running_stats(stats, now=80) == (
         "Free Review: Answered 0 · Solid 0 · Struggle 0 · 0:30"
     )
@@ -213,7 +213,7 @@ def test_undo_then_redo_restores_one_answer() -> None:
     # The grade now lives on the step redo just created, not the original 10.
     assert undo_review_answer(stats, undone_step=10, redo_step=14) is False
     assert undo_review_answer(stats, undone_step=13, redo_step=14) is True
-    assert _tally(stats) == before
+    assert _tally(stats) == (0, 0, 0, {4}, set())
     assert redo_review_answer(stats, redone_step=14, undo_step=15) is True
     assert _tally(stats) == after
 
@@ -258,12 +258,13 @@ def test_undo_and_redo_peel_answers_in_stack_order() -> None:
     assert stats.answered == 1
     assert stats.solid == 1
     assert undo_review_answer(stats, undone_step=1, redo_step=13) is True
-    assert _tally(stats) == (0, 0, 0, set(), set())
+    assert _tally(stats) == (0, 0, 0, {1, 2}, set())
 
     # Redo walks back up the same stack. A later step out of order does not apply.
+    # Cards already seen stay seen.
     assert redo_review_answer(stats, redone_step=10, undo_step=20) is False
     assert redo_review_answer(stats, redone_step=13, undo_step=20) is True
-    assert _tally(stats) == (1, 1, 0, {1}, set())
+    assert _tally(stats) == (1, 1, 0, {1, 2}, set())
     assert redo_review_answer(stats, redone_step=12, undo_step=21) is True
     assert stats.struggle_card_ids == {2}
     assert redo_review_answer(stats, redone_step=11, undo_step=22) is True
@@ -301,7 +302,7 @@ def test_undo_of_good_leaves_an_earlier_struggle_and_a_shown_card() -> None:
     assert undo_review_answer(stats, undone_step=1, redo_step=4) is True
     assert stats.answered == 0
     assert stats.struggle_card_ids == set()
-    # The card was shown before it was graded, so it stays seen.
+    # Shown or answered, the card stays seen. Undo does not rewind that set.
     assert stats.seen_card_ids == {5}
 
     assert redo_review_answer(stats, redone_step=4, undo_step=5) is True
@@ -356,9 +357,8 @@ def test_a_grade_without_an_undo_step_does_not_block_earlier_undo() -> None:
     assert stats.solid == 1
     assert stats.struggle == 0
     assert stats.struggle_card_ids == set()
-    # The Again added card 1 to the seen set, so undoing it removes that.
-    # The Good had no undo step; card 2 stays seen.
-    assert stats.seen_card_ids == {2}
+    # Both grades were counted as seen, and undo does not remove them.
+    assert stats.seen_card_ids == {1, 2}
     assert redo_review_answer(stats, redone_step=9, undo_step=10) is True
     assert stats.struggle_card_ids == {1}
     assert stats.answered == 2

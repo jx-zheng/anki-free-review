@@ -9,6 +9,7 @@ Struggle-set rule: the first Again (1) or Hard (2) puts that card id in
 when no earlier struggle answer for it is still standing. ``solid`` and
 ``struggle`` count answers, not unique cards. The success rate is solid
 answers divided by answers. ``seen_card_ids`` is every card shown or answered.
+Undo and redo do not take a card out of that set.
 
 Graded answers sit on a stack. Undo pops the latest answer's counts, and its
 struggle-set membership when that answer added the card. Redo pushes the same
@@ -62,15 +63,13 @@ class _AnswerRecord:
     ``undo_step`` is Anki's undo counter for this answer as it currently
     sits on the undo stack. Undo and redo each build a new step, so the
     counter is replaced with ``redo_step`` when the answer is undone and
-    with the new undo counter when it is redone. ``added_seen`` and
-    ``added_struggle`` are the set memberships this answer introduced, so
-    undo can drop them and redo can restore them without touching an
-    earlier show or an earlier Again/Hard.
+    with the new undo counter when it is redone. ``added_struggle`` is whether
+    this grade put the card on the struggle set, so undo can drop it and redo
+    can restore it without touching an earlier Again or Hard.
     """
 
     card_id: int
     kind: str
-    added_seen: bool
     added_struggle: bool
     undo_step: int | None = None
     redo_step: int | None = None
@@ -115,7 +114,6 @@ class SessionStats:
         entry = _AnswerRecord(
             card_id=card_id,
             kind=kind,
-            added_seen=card_id not in self.seen_card_ids,
             added_struggle=(
                 kind == "struggle" and card_id not in self.struggle_card_ids
             ),
@@ -179,8 +177,6 @@ class SessionStats:
             self.struggle -= 1
             if entry.added_struggle:
                 self.struggle_card_ids.discard(entry.card_id)
-        if entry.added_seen:
-            self.seen_card_ids.discard(entry.card_id)
 
     def freeze(self, *, now: float) -> None:
         """Stop the elapsed clock at the moment the session ends."""

@@ -1060,7 +1060,7 @@ def test_undo_and_redo_roll_struggle_stats_without_rescheduling(col) -> None:
     assert _undo_tracked(col, stats) is True
     assert stats.answered == 0
     assert stats.solid == 0
-    assert stats.seen_card_ids == set()
+    assert stats.seen_card_ids == set(ids)
     assert _grab(col, solid.id) == in_session[solid.id]
     for cid in ids:
         _schedule_identity(col, cid, before[cid])

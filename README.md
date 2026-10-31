@@ -48,7 +48,7 @@ While the session is open, a line between the card and the answer buttons shows:
 
 **Struggle cards** follow one rule: the first Again or Hard puts that card on the list for the rest of the session, including the summary. A later Good or Easy does not take it off. The list is the cards you had to come back to, not whichever button you pressed last.
 
-The totals stay in memory for that run. They are not written into the restore file, and they do not change cleanup or scheduling. Undo during the session puts the card back and takes that answer out of the tally: answered, solid, struggle, and the struggle set. Redo puts the same answer back. Several Undos peel answers off in reverse order, and Redos put them back in that order. The clock does not rewind. The summary counts the answers that are still standing when you leave.
+The totals stay in memory for that run. They are not written into the restore file, and they do not change cleanup or scheduling. Undo during the session puts the card back and takes that answer out of the tally: answered, solid, struggle, and the struggle set. Cards seen stays once a card has been shown or answered. Redo puts the same answer back. Several Undos peel answers off in reverse order, and Redos put them back in that order. The clock does not rewind. The summary counts the answers that are still standing when you leave.
 
 When you leave the reviewer, a **Free Review summary** dialog shows:
 
@@ -140,7 +140,7 @@ The suite builds a temporary collection and does not touch a real profile. It ch
 - The filtered deck is created with `reschedule` false, and the current scheduling state is preview, not a rescheduling filter.
 - Again, Hard, Good, and Easy, including Again left in progress, leave due, interval, ease, reps, lapses, type, queue, odue, odid, deck id, FSRS stability/difficulty, decay, and the next intervals from `get_scheduling_states` unchanged. A due of 0 stays 0.
 - Suspend, bury, a browser deck move, and Set Due Date done during the session are still there after cleanup.
-- Undo after an answer rolls answered, solid, struggle, and the struggle set back to the pre-answer tally. Redo puts that answer back. Several undos and redos follow stack order, including a card that stays on the struggle list after a later Good. The running line shows the rolled-back counts, and its clock does not rewind. Scheduling fields stay unchanged. A new answer discards grades waiting to be redone.
+- Undo after an answer rolls answered, solid, struggle, and the struggle set back to the pre-answer tally. Cards seen stays. Redo puts that answer back. Several undos and redos follow stack order, including a card that stays on the struggle list after a later Good. The running line shows the rolled-back counts, and its clock does not rewind. Scheduling fields stay unchanged. A new answer discards grades waiting to be redone.
 - Undo after a normal session end does not resurrect the practice deck or put a timestamp back in `due`. The same holds after a session whose answers were undone and redone.
 - A filtered deck that merely matches the Free Review name and search is not deleted.
 - A corrupt restore file is left in place and produces a warning, instead of dropping the saved card states.

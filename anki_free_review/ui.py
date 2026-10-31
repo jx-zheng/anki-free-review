@@ -87,10 +87,11 @@ _elapsed_timer = None
 _pending_redos: list[tuple[int, int]] = []
 _redo_lock = threading.Lock()
 _redo_bridge_installed = False
-# Answer-step counters captured inside the answer op, before that op
+# (card id, undo step) captured inside the answer op, before that op
 # returns. The reviewer success callback runs later on the UI thread, and
 # an Undo queued during the answer can finish first and change last_step.
-_pending_answer_steps: list[int | None] = []
+# The step is None when the op on top was not Answer Card.
+_pending_answer_steps: list[tuple[int, int | None]] = []
 _answer_lock = threading.Lock()
 
 
@@ -375,9 +376,7 @@ def _run_start(source_id: int, track_struggle: bool, op) -> None:
         if not result.ok or not result.deck_id:
             tooltip(result.message or EMPTY_MESSAGE, parent=mw)
             return
-        _active.filtered_id = int(result.deck_id)
-        _active.source_id = int(source_id)
-        _active.stats = begin_session_tracking(track_struggle)
+        _open_tracked_session(int(result.deck_id), int(source_id), track_struggle)
         mw.col.decks.select(result.deck_id)
         mw.moveToState("review")
 
@@ -471,12 +470,12 @@ def _on_reviewer_did_show_question(card) -> None:
 
 
 def _on_reviewer_did_answer_card(_reviewer, card, ease) -> None:
-    # Take the step even when this hook bails out, so a captured counter
-    # cannot be applied to a later grade.
-    undo_step = _take_answer_step()
     try:
         if card is None:
             return
+        # Only this card's step. An older step for a different card (another
+        # add-on answered, or our hook was skipped) is dropped, not reused.
+        undo_step = _take_answer_step(int(card.id))
         in_deck = _reviewing_active_deck()
         kind = accept_review_answer(
             _active.stats,
@@ -518,20 +517,52 @@ def _capture_answer_step(col) -> int | None:
         return None
 
 
-def _remember_answer_step(step: int | None) -> None:
-    """Queue one answer-op result. Safe to call from the collection thread."""
+def _remember_answer_step(card_id: int, step: int | None) -> None:
+    """Queue one answer-op result for this card. Safe from the collection thread."""
 
     with _answer_lock:
-        _pending_answer_steps.append(None if step is None else int(step))
+        _pending_answer_steps.append(
+            (int(card_id), None if step is None else int(step))
+        )
 
 
-def _take_answer_step() -> int | None:
-    """Pop the oldest captured answer step. None when nothing is waiting."""
+def _take_answer_step(card_id: int) -> int | None:
+    """Pop the oldest queued step for ``card_id``.
+
+    Entries before that match are for a grade this hook never saw. They are
+    dropped so the next grade is not recorded under the previous card's step.
+    A step for some other card that is still waiting is left in place.
+    None when this card has nothing queued.
+    """
+
+    card_id = int(card_id)
+    with _answer_lock:
+        for index, (queued_id, step) in enumerate(_pending_answer_steps):
+            if queued_id != card_id:
+                continue
+            del _pending_answer_steps[: index + 1]
+            return step
+        return None
+
+
+def _clear_pending_undo_steps() -> None:
+    """Drop answer and redo steps. A new session must not inherit them."""
 
     with _answer_lock:
-        if not _pending_answer_steps:
-            return None
-        return _pending_answer_steps.pop(0)
+        _pending_answer_steps.clear()
+    with _redo_lock:
+        _pending_redos.clear()
+
+
+def _open_tracked_session(
+    filtered_id: int, source_id: int, track_struggle: bool
+) -> None:
+    """Start the in-memory session for a practice deck that just opened."""
+
+    _clear_pending_undo_steps()
+    _active.filtered_id = int(filtered_id)
+    _active.source_id = int(source_id)
+    _active.stats = begin_session_tracking(track_struggle)
 
 
 def _on_state_did_undo(changes) -> None:
@@ -596,7 +627,15 @@ def _install_redo_bridge(gui_hooks) -> None:
         # Still inside the answer op, so a queued Undo cannot have moved
         # last_step yet. Only a tracked session needs the counter.
         if _active.stats is not None:
-            _remember_answer_step(_capture_answer_step(self.col))
+            try:
+                card_id = int(answer.card_id)
+            except Exception:
+                logger.warning(
+                    "free-review could not read the answered card id",
+                    exc_info=True,
+                )
+                return out
+            _remember_answer_step(card_id, _capture_answer_step(self.col))
         return out
 
     V3Scheduler.answer_card = answer_card
@@ -897,6 +936,7 @@ def _finish_active_tracking() -> tuple[SessionStats | None, int | None]:
     stats = _active.stats
     source_id = _active.source_id
     _active.clear()
+    _clear_pending_undo_steps()
     if stats is not None:
         stats.freeze(now=time.monotonic())
     _hide_stats_label()

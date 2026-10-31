@@ -421,15 +421,53 @@ def test_answer_step_is_only_an_answer_card_and_is_taken_in_order() -> None:
 
     ui._pending_answer_steps.clear()
     try:
-        assert ui._take_answer_step() is None
-        ui._remember_answer_step(answer_undo_step("Answer Card", 6, "Answer Card"))
-        ui._remember_answer_step(answer_undo_step("Undo", 7, "Answer Card"))
-        # A later undo has moved last_step to 7. The grade keeps the captured 6.
-        assert ui._take_answer_step() == 6
-        assert ui._take_answer_step() is None
-        assert ui._take_answer_step() is None
+        assert ui._take_answer_step(1) is None
+        ui._remember_answer_step(1, answer_undo_step("Answer Card", 6, "Answer Card"))
+        ui._remember_answer_step(1, answer_undo_step("Undo", 7, "Answer Card"))
+        # A later undo has moved last_step to 7. This card keeps the captured 6.
+        assert ui._take_answer_step(1) == 6
+        assert ui._take_answer_step(1) is None
+        assert ui._take_answer_step(1) is None
     finally:
         ui._pending_answer_steps.clear()
+
+
+def test_answer_step_matches_the_card_and_sessions_drop_the_queue() -> None:
+    saved = _save_chrome()
+    ui._pending_answer_steps.clear()
+    ui._pending_redos.clear()
+    try:
+        # Another add-on answered card 10, then our hook runs for card 20.
+        ui._remember_answer_step(10, 4)
+        ui._remember_answer_step(20, 9)
+        ui._remember_answer_step(30, 11)
+        assert ui._take_answer_step(20) == 9
+        assert ui._pending_answer_steps == [(30, 11)]
+        # Card 10's step was older than the match, so it is not reused.
+        assert ui._take_answer_step(10) is None
+        assert ui._take_answer_step(30) == 11
+
+        ui._remember_answer_step(40, 2)
+        ui._remember_redo(8, 12)
+        ui._open_tracked_session(5, 1, True)
+        assert ui._pending_answer_steps == []
+        assert ui._pending_redos == []
+        assert ui._active.filtered_id == 5
+        assert ui._active.source_id == 1
+        assert ui._active.stats is not None
+
+        ui._remember_answer_step(40, 2)
+        ui._remember_redo(8, 12)
+        finished, source_id = ui._finish_active_tracking()
+        assert source_id == 1
+        assert finished is not None
+        assert ui._pending_answer_steps == []
+        assert ui._pending_redos == []
+        assert ui._active.stats is None
+    finally:
+        ui._pending_answer_steps.clear()
+        ui._pending_redos.clear()
+        _restore_chrome(saved)
 
 
 def test_running_line_follows_undo_and_redo() -> None:

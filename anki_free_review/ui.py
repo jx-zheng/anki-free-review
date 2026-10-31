@@ -87,6 +87,11 @@ _elapsed_timer = None
 _pending_redos: list[tuple[int, int]] = []
 _redo_lock = threading.Lock()
 _redo_bridge_installed = False
+# Answer-step counters captured inside the answer op, before that op
+# returns. The reviewer success callback runs later on the UI thread, and
+# an Undo queued during the answer can finish first and change last_step.
+_pending_answer_steps: list[int | None] = []
+_answer_lock = threading.Lock()
 
 
 def append_overview_button(links: list, *, deck_is_filtered: bool) -> None:
@@ -466,14 +471,13 @@ def _on_reviewer_did_show_question(card) -> None:
 
 
 def _on_reviewer_did_answer_card(_reviewer, card, ease) -> None:
+    # Take the step even when this hook bails out, so a captured counter
+    # cannot be applied to a later grade.
+    undo_step = _take_answer_step()
     try:
         if card is None:
             return
         in_deck = _reviewing_active_deck()
-        # The answer op has already committed, so last_step is that grade.
-        undo_step = None
-        if in_deck and _active.stats is not None:
-            undo_step = _latest_undo_step()
         kind = accept_review_answer(
             _active.stats,
             in_tracked_deck=in_deck,
@@ -487,18 +491,47 @@ def _on_reviewer_did_answer_card(_reviewer, card, ease) -> None:
         logger.exception("free-review struggle tracking failed")
 
 
-def _latest_undo_step() -> int | None:
-    """Undo counter of the op that just finished, or None if it cannot be read."""
+def answer_undo_step(
+    undo_name: str, last_step: int, answer_op_name: str
+) -> int | None:
+    """Undo counter of a grade, or None when the top op is not that grade.
+
+    Compared by Anki's own op name (``actions-answer-card``), which is
+    translated. A later undo must not be stored in place of the grade.
+    """
+
+    if undo_name != answer_op_name:
+        return None
+    return int(last_step)
+
+
+def _capture_answer_step(col) -> int | None:
+    """Read the grade's undo counter. Called before the answer op returns."""
 
     try:
-        from aqt import mw
-
-        if not mw.col:
-            return None
-        return int(mw.col.undo_status().last_step)
+        status = col.undo_status()
+        return answer_undo_step(
+            status.undo, int(status.last_step), col.tr.actions_answer_card()
+        )
     except Exception:
-        logger.warning("free-review could not read the undo step", exc_info=True)
+        logger.warning("free-review could not read the answer undo step", exc_info=True)
         return None
+
+
+def _remember_answer_step(step: int | None) -> None:
+    """Queue one answer-op result. Safe to call from the collection thread."""
+
+    with _answer_lock:
+        _pending_answer_steps.append(None if step is None else int(step))
+
+
+def _take_answer_step() -> int | None:
+    """Pop the oldest captured answer step. None when nothing is waiting."""
+
+    with _answer_lock:
+        if not _pending_answer_steps:
+            return None
+        return _pending_answer_steps.pop(0)
 
 
 def _on_state_did_undo(changes) -> None:
@@ -518,10 +551,13 @@ def _on_state_did_undo(changes) -> None:
 
 
 def _install_redo_bridge(gui_hooks) -> None:
-    """Notice Redo, which does not emit state_did_undo.
+    """Notice Redo, and capture each grade's undo counter inside the answer op.
 
-    Skipped when aqt is missing (the test suite). The wrap only records
-    counters; the tally is updated on the UI thread.
+    Redo does not emit state_did_undo. The answer counter cannot be read in
+    the reviewer success callback: that callback is queued on the UI thread,
+    and an Undo started while the answer op is still running can finish
+    first and change ``last_step``. Skipped when aqt is missing (pytest).
+    The wraps only record counters; the tally is updated on the UI thread.
     """
 
     global _redo_bridge_installed
@@ -550,6 +586,20 @@ def _install_redo_bridge(gui_hooks) -> None:
         return out
 
     Collection.redo = redo
+
+    from anki.scheduler.v3 import Scheduler as V3Scheduler
+
+    original_answer = V3Scheduler.answer_card
+
+    def answer_card(self, answer):
+        out = original_answer(self, answer)
+        # Still inside the answer op, so a queued Undo cannot have moved
+        # last_step yet. Only a tracked session needs the counter.
+        if _active.stats is not None:
+            _remember_answer_step(_capture_answer_step(self.col))
+        return out
+
+    V3Scheduler.answer_card = answer_card
     gui_hooks.operation_did_execute.append(_on_operation_did_execute)
     _redo_bridge_installed = True
 

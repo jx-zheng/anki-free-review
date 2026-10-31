@@ -98,9 +98,13 @@ class SessionStats:
     ) -> str | None:
         """Count one answer. Again/Hard joins the struggle set and stays there.
 
-        ``undo_step`` is the collection undo counter after this grade. Undo
-        of a different step leaves the tally alone. A grade clears answers
-        waiting to be redone.
+        ``undo_step`` is the collection undo counter of this grade, read
+        inside the answer op. Undo of a different step leaves the tally
+        alone. A grade clears answers waiting to be redone.
+
+        A missing counter is still counted, but it is not pushed onto the
+        stack. Undo only peels ``_answers[-1]``, so a ``None`` step there
+        would block every earlier grade for the rest of the session.
         """
 
         kind = classify_ease(ease)
@@ -117,7 +121,8 @@ class SessionStats:
             ),
             undo_step=None if undo_step is None else int(undo_step),
         )
-        self._answers.append(entry)
+        if entry.undo_step is not None:
+            self._answers.append(entry)
         self._apply(entry)
         return kind
 

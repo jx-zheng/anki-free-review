@@ -409,6 +409,29 @@ def test_undo_and_redo_hooks_follow_the_answer_stack() -> None:
         _restore_chrome(saved)
 
 
+def test_answer_step_is_only_an_answer_card_and_is_taken_in_order() -> None:
+    from anki_free_review.ui import answer_undo_step
+
+    assert answer_undo_step("Answer Card", 6, "Answer Card") == 6
+    assert answer_undo_step("Update Card", 7, "Answer Card") is None
+    assert answer_undo_step("", 7, "Answer Card") is None
+    # The name Anki reports is translated; a different translation does not match.
+    assert answer_undo_step("Antworten", 8, "Answer Card") is None
+    assert answer_undo_step("Antworten", 8, "Antworten") == 8
+
+    ui._pending_answer_steps.clear()
+    try:
+        assert ui._take_answer_step() is None
+        ui._remember_answer_step(answer_undo_step("Answer Card", 6, "Answer Card"))
+        ui._remember_answer_step(answer_undo_step("Undo", 7, "Answer Card"))
+        # A later undo has moved last_step to 7. The grade keeps the captured 6.
+        assert ui._take_answer_step() == 6
+        assert ui._take_answer_step() is None
+        assert ui._take_answer_step() is None
+    finally:
+        ui._pending_answer_steps.clear()
+
+
 def test_running_line_follows_undo_and_redo() -> None:
     from anki_free_review.tracking import (
         accept_review_answer,

@@ -960,6 +960,37 @@ def _redo_tracked(col, stats) -> bool:
     )
 
 
+def test_captured_answer_step_matches_the_grade_not_a_later_undo(col) -> None:
+    """The counter read at the end of the answer is the one Undo reports.
+
+    Reading ``last_step`` after a following undo returns that undo's new
+    step instead, which is the race the reviewer callback has to avoid.
+    """
+
+    from anki_free_review.ui import answer_undo_step
+
+    deck_id = col.decks.id("AnswerStep")
+    card = _review(col, "q", deck_id, due=4, ivl=3, reps=1)
+    _answer(col, card.id, 3)
+    status = col.undo_status()
+    captured = answer_undo_step(
+        status.undo, int(status.last_step), col.tr.actions_answer_card()
+    )
+    assert captured is not None
+    assert status.undo == col.tr.actions_answer_card()
+    undone = col.undo()
+    assert int(undone.counter) == captured
+    assert int(col.undo_status().last_step) != captured
+    assert (
+        answer_undo_step(
+            col.undo_status().undo,
+            int(col.undo_status().last_step),
+            col.tr.actions_answer_card(),
+        )
+        is None
+    )
+
+
 def test_undo_and_redo_roll_struggle_stats_without_rescheduling(col) -> None:
     """Answer, undo, and redo keep the tally on the same stack as the grades.
 

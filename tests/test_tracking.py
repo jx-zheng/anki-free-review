@@ -326,3 +326,39 @@ def test_undo_of_good_leaves_an_earlier_struggle_and_a_shown_card() -> None:
     assert _tally(stats) == (2, 1, 1, {5, 6}, {5})
     assert undo_review_answer(None, undone_step=10, redo_step=12) is False
     assert redo_review_answer(None, redone_step=12, undo_step=13) is False
+
+
+def test_a_grade_without_an_undo_step_does_not_block_earlier_undo() -> None:
+    """A missing counter is counted, but it must not sit on the matchable stack."""
+
+    stats = begin_session_tracking(True, now=0)
+    assert stats is not None
+    assert (
+        accept_review_answer(
+            stats, in_tracked_deck=True, card_id=1, ease=1, undo_step=4
+        )
+        == "struggle"
+    )
+    assert (
+        accept_review_answer(
+            stats, in_tracked_deck=True, card_id=2, ease=3, undo_step=None
+        )
+        == "solid"
+    )
+    assert stats.answered == 2
+    assert stats.solid == 1
+    assert stats.struggle == 1
+    assert stats.struggle_card_ids == {1}
+
+    assert undo_review_answer(stats, undone_step=4, redo_step=9) is True
+    # The untracked Good stays. The Again is gone, so the set goes with it.
+    assert stats.answered == 1
+    assert stats.solid == 1
+    assert stats.struggle == 0
+    assert stats.struggle_card_ids == set()
+    # The Again added card 1 to the seen set, so undoing it removes that.
+    # The Good had no undo step; card 2 stays seen.
+    assert stats.seen_card_ids == {2}
+    assert redo_review_answer(stats, redone_step=9, undo_step=10) is True
+    assert stats.struggle_card_ids == {1}
+    assert stats.answered == 2

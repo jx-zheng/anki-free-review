@@ -26,6 +26,7 @@ class _Hooks:
         self.sync_will_start = _Hook()
         self.reviewer_did_answer_card = _Hook()
         self.reviewer_did_show_question = _Hook()
+        self.state_did_undo = _Hook()
 
 
 def test_package_imports_without_aqt() -> None:
@@ -47,6 +48,7 @@ def test_install_hooks_registers_each_entry_point() -> None:
     assert hooks.sync_will_start.callbacks == [ui._on_sync_will_start]
     assert hooks.reviewer_did_answer_card.callbacks == [ui._on_reviewer_did_answer_card]
     assert hooks.reviewer_did_show_question.callbacks == [ui._on_reviewer_did_show_question]
+    assert hooks.state_did_undo.callbacks == [ui._on_state_did_undo]
 
 
 def test_overview_button_is_hidden_on_filtered_decks() -> None:
@@ -337,6 +339,177 @@ def test_elapsed_tick_rewrites_the_clock_and_stops_when_the_session_ends() -> No
         assert not timer.active
         assert label.text == ""
         assert not label.visible
+    finally:
+        _restore_chrome(saved)
+
+
+class _UndoStatus:
+    def __init__(self, last_step: int) -> None:
+        self.last_step = last_step
+
+
+class _UndoChanges:
+    def __init__(self, counter: int, last_step: int) -> None:
+        self.counter = counter
+        self.new_status = _UndoStatus(last_step)
+
+
+def test_undo_and_redo_hooks_follow_the_answer_stack() -> None:
+    from anki_free_review.tracking import (
+        accept_review_answer,
+        begin_session_tracking,
+        redo_review_answer,
+    )
+
+    saved = _save_chrome()
+    ui._pending_redos.clear()
+    try:
+        stats = begin_session_tracking(True, now=0)
+        assert stats is not None
+        ui._active.stats = stats
+        ui._active.filtered_id = 5
+        assert (
+            accept_review_answer(
+                stats, in_tracked_deck=True, card_id=8, ease=1, undo_step=4
+            )
+            == "struggle"
+        )
+        assert (
+            accept_review_answer(
+                stats, in_tracked_deck=True, card_id=9, ease=3, undo_step=5
+            )
+            == "solid"
+        )
+
+        ui._on_state_did_undo(_UndoChanges(99, 100))
+        assert stats.answered == 2
+        ui._on_state_did_undo(_UndoChanges(5, 6))
+        assert stats.answered == 1
+        assert stats.solid == 0
+        assert stats.struggle == 1
+        assert stats.struggle_card_ids == {8}
+
+        ui._remember_redo(100, 101)
+        ui._on_operation_did_execute(None, None)
+        assert stats.answered == 1
+        ui._remember_redo(6, 7)
+        ui._on_operation_did_execute(None, None)
+        assert stats.answered == 2
+        assert stats.solid == 1
+        assert stats.struggle_card_ids == {8}
+
+        # The redone Good is undone by the new counter, then redone again.
+        ui._on_state_did_undo(_UndoChanges(7, 8))
+        assert stats.solid == 0
+        assert redo_review_answer(stats, redone_step=8, undo_step=9) is True
+        assert stats.answered == 2
+        assert stats.solid == 1
+    finally:
+        ui._pending_redos.clear()
+        _restore_chrome(saved)
+
+
+def test_answer_step_is_only_an_answer_card_and_is_taken_in_order() -> None:
+    from anki_free_review.ui import answer_undo_step
+
+    assert answer_undo_step("Answer Card", 6, "Answer Card") == 6
+    assert answer_undo_step("Update Card", 7, "Answer Card") is None
+    assert answer_undo_step("", 7, "Answer Card") is None
+    # The name Anki reports is translated; a different translation does not match.
+    assert answer_undo_step("Antworten", 8, "Answer Card") is None
+    assert answer_undo_step("Antworten", 8, "Antworten") == 8
+
+    ui._pending_answer_steps.clear()
+    try:
+        assert ui._take_answer_step(1) is None
+        ui._remember_answer_step(1, answer_undo_step("Answer Card", 6, "Answer Card"))
+        ui._remember_answer_step(1, answer_undo_step("Undo", 7, "Answer Card"))
+        # A later undo has moved last_step to 7. This card keeps the captured 6.
+        assert ui._take_answer_step(1) == 6
+        assert ui._take_answer_step(1) is None
+        assert ui._take_answer_step(1) is None
+    finally:
+        ui._pending_answer_steps.clear()
+
+
+def test_answer_step_matches_the_card_and_sessions_drop_the_queue() -> None:
+    saved = _save_chrome()
+    ui._pending_answer_steps.clear()
+    ui._pending_redos.clear()
+    try:
+        # Another add-on answered card 10, then our hook runs for card 20.
+        ui._remember_answer_step(10, 4)
+        ui._remember_answer_step(20, 9)
+        ui._remember_answer_step(30, 11)
+        assert ui._take_answer_step(20) == 9
+        assert ui._pending_answer_steps == [(30, 11)]
+        # Card 10's step was older than the match, so it is not reused.
+        assert ui._take_answer_step(10) is None
+        assert ui._take_answer_step(30) == 11
+
+        ui._remember_answer_step(40, 2)
+        ui._remember_redo(8, 12)
+        ui._open_tracked_session(5, 1, True)
+        assert ui._pending_answer_steps == []
+        assert ui._pending_redos == []
+        assert ui._active.filtered_id == 5
+        assert ui._active.source_id == 1
+        assert ui._active.stats is not None
+
+        ui._remember_answer_step(40, 2)
+        ui._remember_redo(8, 12)
+        finished, source_id = ui._finish_active_tracking()
+        assert source_id == 1
+        assert finished is not None
+        assert ui._pending_answer_steps == []
+        assert ui._pending_redos == []
+        assert ui._active.stats is None
+    finally:
+        ui._pending_answer_steps.clear()
+        ui._pending_redos.clear()
+        _restore_chrome(saved)
+
+
+def test_running_line_follows_undo_and_redo() -> None:
+    from anki_free_review.tracking import (
+        accept_review_answer,
+        begin_session_tracking,
+        redo_review_answer,
+        undo_review_answer,
+    )
+
+    saved = _save_chrome()
+    try:
+        stats = begin_session_tracking(True, now=100)
+        assert stats is not None
+        ui._active.stats = stats
+        assert (
+            accept_review_answer(
+                stats, in_tracked_deck=True, card_id=4, ease=3, undo_step=7
+            )
+            == "solid"
+        )
+        label = _FakeLabel()
+        label.show()
+        timer = _FakeTimer()
+        ui._install_elapsed_timer(timer)
+        timer.start()
+        ui._stats_label = label
+
+        shown = ui._apply_elapsed_tick(reviewing=True, in_tracked_deck=True, now=104)
+        assert shown == "Free Review: Answered 1 · Solid 1 · Struggle 0 · 0:04"
+        assert label.text == shown
+
+        assert undo_review_answer(stats, undone_step=7, redo_step=8) is True
+        shown = ui._apply_elapsed_tick(reviewing=True, in_tracked_deck=True, now=110)
+        assert shown == "Free Review: Answered 0 · Solid 0 · Struggle 0 · 0:10"
+        assert label.text == shown
+        assert timer.active
+
+        assert redo_review_answer(stats, redone_step=8, undo_step=9) is True
+        shown = ui._apply_elapsed_tick(reviewing=True, in_tracked_deck=True, now=111)
+        assert shown == "Free Review: Answered 1 · Solid 1 · Struggle 0 · 0:11"
+        assert label.text == shown
     finally:
         _restore_chrome(saved)
 

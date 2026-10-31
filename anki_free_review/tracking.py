@@ -5,9 +5,16 @@ stays on the filtered-deck preview path.
 
 Struggle-set rule: the first Again (1) or Hard (2) puts that card id in
 ``struggle_card_ids`` for the rest of the session. A later Good (3) or Easy
-(4) does not remove it. ``solid`` and ``struggle`` count answers, not unique
-cards. The success rate is solid answers divided by answers. ``seen_card_ids``
-is every card shown or answered.
+(4) does not remove it. Undo of that Again or Hard takes the card off the set
+when no earlier struggle answer for it is still standing. ``solid`` and
+``struggle`` count answers, not unique cards. The success rate is solid
+answers divided by answers. ``seen_card_ids`` is every card shown or answered.
+Undo and redo do not take a card out of that set.
+
+Graded answers sit on a stack. Undo pops the latest answer's counts, and its
+struggle-set membership when that answer added the card. Redo pushes the same
+answer back. A new answer clears the redo stack, same as Anki dropping its
+redo queue when the next grade is given. The elapsed clock is not rewound.
 """
 
 from __future__ import annotations
@@ -50,6 +57,25 @@ def classify_ease(ease: int) -> str | None:
 
 
 @dataclass
+class _AnswerRecord:
+    """One graded answer, and how to put it back after undo.
+
+    ``undo_step`` is Anki's undo counter for this answer as it currently
+    sits on the undo stack. Undo and redo each build a new step, so the
+    counter is replaced with ``redo_step`` when the answer is undone and
+    with the new undo counter when it is redone. ``added_struggle`` is whether
+    this grade put the card on the struggle set, so undo can drop it and redo
+    can restore it without touching an earlier Again or Hard.
+    """
+
+    card_id: int
+    kind: str
+    added_struggle: bool
+    undo_step: int | None = None
+    redo_step: int | None = None
+
+
+@dataclass
 class SessionStats:
     """Answer totals for a single tracked Free Review run."""
 
@@ -60,25 +86,97 @@ class SessionStats:
     struggle: int = 0
     seen_card_ids: set[int] = field(default_factory=set)
     struggle_card_ids: set[int] = field(default_factory=set)
+    _answers: list[_AnswerRecord] = field(default_factory=list, repr=False)
+    _redo: list[_AnswerRecord] = field(default_factory=list, repr=False)
 
     def note_seen(self, card_id: int) -> None:
         self.seen_card_ids.add(int(card_id))
 
-    def record_answer(self, card_id: int, ease: int) -> str | None:
-        """Count one answer. Again/Hard joins the struggle set and stays there."""
+    def record_answer(
+        self, card_id: int, ease: int, *, undo_step: int | None = None
+    ) -> str | None:
+        """Count one answer. Again/Hard joins the struggle set and stays there.
+
+        ``undo_step`` is the collection undo counter of this grade, read
+        inside the answer op. Undo of a different step leaves the tally
+        alone. A grade clears answers waiting to be redone.
+
+        A missing counter is still counted, but it is not pushed onto the
+        stack. Undo only peels ``_answers[-1]``, so a ``None`` step there
+        would block every earlier grade for the rest of the session.
+        """
 
         kind = classify_ease(ease)
         if kind is None:
             return None
         card_id = int(card_id)
-        self.seen_card_ids.add(card_id)
-        self.answered += 1
-        if kind == "solid":
-            self.solid += 1
-            return kind
-        self.struggle += 1
-        self.struggle_card_ids.add(card_id)
+        self._redo.clear()
+        entry = _AnswerRecord(
+            card_id=card_id,
+            kind=kind,
+            added_struggle=(
+                kind == "struggle" and card_id not in self.struggle_card_ids
+            ),
+            undo_step=None if undo_step is None else int(undo_step),
+        )
+        if entry.undo_step is not None:
+            self._answers.append(entry)
+        self._apply(entry)
         return kind
+
+    def undo_answer(self, undone_step: int, redo_step: int) -> bool:
+        """Pop the latest answer when ``undone_step`` is its undo counter.
+
+        False leaves the tally unchanged: this undo is not the latest grade.
+        """
+
+        if not self._answers:
+            return False
+        entry = self._answers[-1]
+        if entry.undo_step != int(undone_step):
+            return False
+        self._answers.pop()
+        entry.redo_step = int(redo_step)
+        self._redo.append(entry)
+        self._unapply(entry)
+        return True
+
+    def redo_answer(self, redone_step: int, undo_step: int) -> bool:
+        """Re-apply the latest undone answer when ``redone_step`` matches it.
+
+        ``undo_step`` is the counter Anki assigned when it put the grade
+        back on the undo stack, so a later Undo finds this same answer.
+        """
+
+        if not self._redo:
+            return False
+        entry = self._redo[-1]
+        if entry.redo_step != int(redone_step):
+            return False
+        self._redo.pop()
+        entry.undo_step = int(undo_step)
+        self._answers.append(entry)
+        self._apply(entry)
+        return True
+
+    def _apply(self, entry: _AnswerRecord) -> None:
+        self.seen_card_ids.add(entry.card_id)
+        self.answered += 1
+        if entry.kind == "solid":
+            self.solid += 1
+            return
+        self.struggle += 1
+        if entry.added_struggle:
+            self.struggle_card_ids.add(entry.card_id)
+
+    def _unapply(self, entry: _AnswerRecord) -> None:
+        self.answered -= 1
+        if entry.kind == "solid":
+            self.solid -= 1
+        else:
+            self.struggle -= 1
+            if entry.added_struggle:
+                self.struggle_card_ids.discard(entry.card_id)
 
     def freeze(self, *, now: float) -> None:
         """Stop the elapsed clock at the moment the session ends."""
@@ -113,17 +211,43 @@ def note_card_seen(
 
 
 def accept_review_answer(
-    stats: SessionStats | None, *, in_tracked_deck: bool, card_id: int, ease: int
+    stats: SessionStats | None,
+    *,
+    in_tracked_deck: bool,
+    card_id: int,
+    ease: int,
+    undo_step: int | None = None,
 ) -> str | None:
     """Count an answer when the reviewer is still on the practice deck.
 
     The caller decides that. Good and Easy return the card home before the
     reviewer hook runs, so ``card.did`` is not the practice deck.
+    ``undo_step`` is the collection undo counter of this grade.
     """
 
     if stats is None or not in_tracked_deck:
         return None
-    return stats.record_answer(card_id, ease)
+    return stats.record_answer(card_id, ease, undo_step=undo_step)
+
+
+def undo_review_answer(
+    stats: SessionStats | None, *, undone_step: int, redo_step: int
+) -> bool:
+    """Roll back one graded answer. False when this undo is not that grade."""
+
+    if stats is None:
+        return False
+    return stats.undo_answer(undone_step, redo_step)
+
+
+def redo_review_answer(
+    stats: SessionStats | None, *, redone_step: int, undo_step: int
+) -> bool:
+    """Put back one undone grade. False when this redo is not that grade."""
+
+    if stats is None:
+        return False
+    return stats.redo_answer(redone_step, undo_step)
 
 
 def should_show_summary(stats: SessionStats | None) -> bool:

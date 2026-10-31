@@ -11,6 +11,7 @@ import json
 import os
 
 import anki.consts as C
+import pytest
 from anki.cards import FSRSMemoryState
 from anki.decks import FilteredDeckConfig
 from anki.scheduler import FilteredDeckForUpdate
@@ -41,11 +42,14 @@ from anki_free_review.session import (
     take_snapshot_warnings,
 )
 from anki_free_review.tracking import (
+    accept_review_answer,
     begin_session_tracking,
     format_running_stats,
     format_summary_text,
+    redo_review_answer,
     should_show_summary,
     struggle_browser_search,
+    undo_review_answer,
 )
 
 
@@ -927,6 +931,193 @@ def test_struggle_search_skips_new_and_suspended_cards(col) -> None:
     assert int(col.get_card(suspended.id).queue) == C.QUEUE_TYPE_SUSPENDED
     assert int(col.get_card(keep.id).odid) == 0
     assert int(col.get_card(new.id).queue) == C.QUEUE_TYPE_NEW
+
+
+def _schedule_identity(col, cid: int, snap: dict) -> None:
+    card = col.get_card(cid)
+    assert int(card.type) == snap["type"]
+    assert int(card.ivl) == snap["ivl"]
+    assert int(card.factor) == snap["factor"]
+    assert int(card.reps) == snap["reps"]
+    assert int(card.lapses) == snap["lapses"]
+
+
+def _undo_tracked(col, stats) -> bool:
+    out = col.undo()
+    return undo_review_answer(
+        stats,
+        undone_step=int(out.counter),
+        redo_step=int(out.new_status.last_step),
+    )
+
+
+def _redo_tracked(col, stats) -> bool:
+    out = col.redo()
+    return redo_review_answer(
+        stats,
+        redone_step=int(out.counter),
+        undo_step=int(out.new_status.last_step),
+    )
+
+
+def test_captured_answer_step_matches_the_grade_not_a_later_undo(col) -> None:
+    """The counter read at the end of the answer is the one Undo reports.
+
+    Reading ``last_step`` after a following undo returns that undo's new
+    step instead, which is the race the reviewer callback has to avoid.
+    """
+
+    from anki_free_review.ui import answer_undo_step
+
+    deck_id = col.decks.id("AnswerStep")
+    card = _review(col, "q", deck_id, due=4, ivl=3, reps=1)
+    _answer(col, card.id, 3)
+    status = col.undo_status()
+    captured = answer_undo_step(
+        status.undo, int(status.last_step), col.tr.actions_answer_card()
+    )
+    assert captured is not None
+    assert status.undo == col.tr.actions_answer_card()
+    undone = col.undo()
+    assert int(undone.counter) == captured
+    assert int(col.undo_status().last_step) != captured
+    assert (
+        answer_undo_step(
+            col.undo_status().undo,
+            int(col.undo_status().last_step),
+            col.tr.actions_answer_card(),
+        )
+        is None
+    )
+
+
+def test_undo_and_redo_roll_struggle_stats_without_rescheduling(col) -> None:
+    """Answer, undo, and redo keep the tally on the same stack as the grades.
+
+    Anki mints a new undo counter every time a step is undone or redone.
+    The tally follows those counters. Scheduling columns stay put, and
+    cleanup still collapses to one undo that does not bring the deck back.
+    """
+
+    deck_id = col.decks.id("StatsUndo")
+    solid = _review(col, "solid", deck_id, due=5, ivl=4, reps=2)
+    struggle = _review(col, "struggle", deck_id, due=0, ivl=4, reps=2)
+    ids = [solid.id, struggle.id]
+    before = {cid: _grab(col, cid) for cid in ids}
+
+    result = start_free_review(col, deck_id)
+    assert result.ok, result.message
+    in_session = {cid: _grab(col, cid) for cid in ids}
+    stats = begin_session_tracking(True, now=1_000.0)
+    assert stats is not None
+
+    def grade(card, ease: int) -> dict:
+        _answer(col, card.id, ease)
+        step = int(col.undo_status().last_step)
+        kind = accept_review_answer(
+            stats,
+            in_tracked_deck=True,
+            card_id=card.id,
+            ease=ease,
+            undo_step=step,
+        )
+        assert kind in {"solid", "struggle"}
+        return _grab(col, card.id)
+
+    after_solid = grade(solid, 3)
+    after_again = grade(struggle, 1)
+    after_hard = grade(struggle, 2)
+    assert stats.answered == 3
+    assert stats.solid == 1
+    assert stats.struggle == 2
+    assert stats.struggle_card_ids == {struggle.id}
+    assert format_running_stats(stats, now=1_030.0) == (
+        "Free Review: Answered 3 · Solid 1 · Struggle 2 · 0:30"
+    )
+    for cid in ids:
+        _schedule_identity(col, cid, before[cid])
+
+    edited = col.get_card(solid.id)
+    edited.flags = 1
+    col.update_card(edited)
+    assert _undo_tracked(col, stats) is False
+    assert stats.answered == 3
+    assert int(col.get_card(solid.id).flags) == 0
+
+    assert _undo_tracked(col, stats) is True
+    assert stats.answered == 2
+    assert stats.solid == 1
+    assert stats.struggle == 1
+    assert stats.struggle_card_ids == {struggle.id}
+    assert _grab(col, struggle.id) == after_again
+
+    assert _undo_tracked(col, stats) is True
+    assert stats.answered == 1
+    assert stats.struggle == 0
+    assert stats.struggle_card_ids == set()
+    assert _grab(col, struggle.id) == in_session[struggle.id]
+
+    assert _undo_tracked(col, stats) is True
+    assert stats.answered == 0
+    assert stats.solid == 0
+    assert stats.seen_card_ids == set(ids)
+    assert _grab(col, solid.id) == in_session[solid.id]
+    for cid in ids:
+        _schedule_identity(col, cid, before[cid])
+
+    assert _redo_tracked(col, stats) is True
+    assert stats.answered == 1
+    assert stats.solid == 1
+    assert stats.struggle == 0
+    assert _grab(col, solid.id) == after_solid
+
+    assert _redo_tracked(col, stats) is True
+    assert stats.struggle_card_ids == {struggle.id}
+    assert stats.struggle == 1
+    assert _grab(col, struggle.id) == after_again
+
+    assert _redo_tracked(col, stats) is True
+    assert stats.answered == 3
+    assert stats.solid == 1
+    assert stats.struggle == 2
+    assert _grab(col, struggle.id) == after_hard
+
+    # The flag edit is still on Anki's redo queue. It is not a grade.
+    assert _redo_tracked(col, stats) is False
+    assert stats.answered == 3
+    assert int(col.get_card(solid.id).flags) == 1
+
+    assert _undo_tracked(col, stats) is False
+    assert stats.answered == 3
+    assert _undo_tracked(col, stats) is True
+    assert stats.answered == 2
+    assert stats.struggle == 1
+    assert format_running_stats(stats, now=1_030.0) == (
+        "Free Review: Answered 2 · Solid 1 · Struggle 1 · 0:30"
+    )
+    assert _redo_tracked(col, stats) is True
+    assert stats.answered == 3
+    assert stats.struggle == 2
+
+    # Another grade clears Anki's redo queue, so the flag edit cannot return.
+    grade(struggle, 3)
+    assert stats.answered == 4
+    assert stats.solid == 2
+    assert stats.struggle == 2
+    assert struggle.id in stats.struggle_card_ids
+    with pytest.raises(UndoEmpty):
+        col.redo()
+    assert stats.answered == 4
+    for cid in ids:
+        _schedule_identity(col, cid, before[cid])
+
+    assert cleanup_free_review_deck(col, result.deck_id)
+    for cid in ids:
+        assert _grab(col, cid) == before[cid]
+    col.undo()
+    for cid in ids:
+        assert _grab(col, cid) == before[cid]
+    assert not any(name.startswith(FREE_REVIEW_PREFIX) for name in _names(col))
 
 
 def test_struggle_review_undo_does_not_resurrect_the_practice_deck(col) -> None:

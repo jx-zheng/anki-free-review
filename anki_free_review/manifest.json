@@ -2,7 +2,7 @@
   "name": "Free Review",
   "package": "anki_free_review",
   "homepage": "https://github.com/jx-zheng/anki-free-review",
-  "human_version": "1.2.1",
+  "human_version": "1.2.2",
   "min_point_version": 250902,
   "conflicts": []
 }

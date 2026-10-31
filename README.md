@@ -48,7 +48,7 @@ While the session is open, a line between the card and the answer buttons shows:
 
 **Struggle cards** follow one rule: the first Again or Hard puts that card on the list for the rest of the session, including the summary. A later Good or Easy does not take it off. The list is the cards you had to come back to, not whichever button you pressed last.
 
-The totals stay in memory for that run. They are not written into the restore file, and they do not change undo, cleanup, or scheduling. Undo during the session puts the card back, but it does not rewind the tally. The summary counts the buttons you pressed.
+The totals stay in memory for that run. They are not written into the restore file, and they do not change cleanup or scheduling. Undo during the session puts the card back and takes that answer out of the tally: answered, solid, struggle, and the struggle set. Redo puts the same answer back. Several Undos peel answers off in reverse order, and Redos put them back in that order. The clock does not rewind. The summary counts the answers that are still standing when you leave.
 
 When you leave the reviewer, a **Free Review summary** dialog shows:
 
@@ -85,7 +85,7 @@ Suspend, bury, and moving the card to another deck during the session are kept. 
 
 On Anki 25.9.2, answering in this preview deck did **not** sibling-bury the other card on the note (checked for a new sibling, and for a second review card that was also in the practice deck). If a future Anki version does bury siblings, that bury is left in place.
 
-While the session is still open, Undo is one step named Free Review: build, answers, removal, and the due/decay patch. Undoing it returns to the moment before Free Review. It does not leave the temporary deck behind or a timestamp in `due`. If Anki was killed mid-session, the cleanup on next launch is a new undo step, because the old undo stack is gone. Undoing that step can bring the practice deck back; don't undo it, or restart so cleanup can run again.
+While the session is still open, each answer is its own Undo step. Undo puts the card back and takes that answer out of the struggle tally. Redo puts the same answer back on the tally. When you leave, cleanup folds the build, the answers still standing, the removal, and the due/decay patch into one Undo step named Free Review. One Undo then returns to the moment before Free Review. It does not leave the temporary deck behind or a timestamp in `due`. If Anki was killed mid-session, the cleanup on next launch is a new undo step, because the old undo stack is gone. Undoing that step can bring the practice deck back; don't undo it, or restart so cleanup can run again.
 
 The addon does not call a rescheduling answer path and does not set `reschedule` to true. Struggle tracking only counts answers. It does not write card fields, and the struggle revisit deck uses this same preview path.
 
@@ -140,7 +140,8 @@ The suite builds a temporary collection and does not touch a real profile. It ch
 - The filtered deck is created with `reschedule` false, and the current scheduling state is preview, not a rescheduling filter.
 - Again, Hard, Good, and Easy, including Again left in progress, leave due, interval, ease, reps, lapses, type, queue, odue, odid, deck id, FSRS stability/difficulty, decay, and the next intervals from `get_scheduling_states` unchanged. A due of 0 stays 0.
 - Suspend, bury, a browser deck move, and Set Due Date done during the session are still there after cleanup.
-- Undo after a normal session end does not resurrect the practice deck or put a timestamp back in `due`.
+- Undo after an answer rolls answered, solid, struggle, and the struggle set back to the pre-answer tally. Redo puts that answer back. Several undos and redos follow stack order, including a card that stays on the struggle list after a later Good. The running line shows the rolled-back counts, and its clock does not rewind. Scheduling fields stay unchanged. A new answer discards grades waiting to be redone.
+- Undo after a normal session end does not resurrect the practice deck or put a timestamp back in `due`. The same holds after a session whose answers were undone and redone.
 - A filtered deck that merely matches the Free Review name and search is not deleted.
 - A corrupt restore file is left in place and produces a warning, instead of dropping the saved card states.
 - Revlog rows written by those answers are only type cram.

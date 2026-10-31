@@ -19,10 +19,12 @@ from anki_free_review.tracking import (
     format_success_rate,
     format_summary_text,
     note_card_seen,
+    redo_review_answer,
     should_show_summary,
     struggle_browser_search,
     summary_actions,
     tracking_enabled_from_config,
+    undo_review_answer,
 )
 
 
@@ -164,3 +166,163 @@ def test_tracking_off_does_not_record_or_require_a_summary() -> None:
     )
     assert stats.struggle_card_ids == {4}
     assert should_show_summary(stats) is True
+
+
+def _tally(stats) -> tuple:
+    return (
+        stats.answered,
+        stats.solid,
+        stats.struggle,
+        set(stats.seen_card_ids),
+        set(stats.struggle_card_ids),
+    )
+
+
+def test_undo_then_redo_restores_one_answer() -> None:
+    stats = begin_session_tracking(True, now=50)
+    assert stats is not None
+    before = _tally(stats)
+    assert (
+        accept_review_answer(
+            stats, in_tracked_deck=True, card_id=4, ease=3, undo_step=10
+        )
+        == "solid"
+    )
+    after = _tally(stats)
+    assert after == (1, 1, 0, {4}, set())
+    assert format_running_stats(stats, now=80) == (
+        "Free Review: Answered 1 · Solid 1 · Struggle 0 · 0:30"
+    )
+
+    # Not this grade: an edit, a bury, or the deck build.
+    assert undo_review_answer(stats, undone_step=9, redo_step=11) is False
+    assert _tally(stats) == after
+
+    assert undo_review_answer(stats, undone_step=10, redo_step=11) is True
+    assert _tally(stats) == before
+    assert format_running_stats(stats, now=80) == (
+        "Free Review: Answered 0 · Solid 0 · Struggle 0 · 0:30"
+    )
+    assert undo_review_answer(stats, undone_step=10, redo_step=12) is False
+
+    assert redo_review_answer(stats, redone_step=11, undo_step=13) is True
+    assert _tally(stats) == after
+    assert format_running_stats(stats, now=95) == (
+        "Free Review: Answered 1 · Solid 1 · Struggle 0 · 0:45"
+    )
+    # The grade now lives on the step redo just created, not the original 10.
+    assert undo_review_answer(stats, undone_step=10, redo_step=14) is False
+    assert undo_review_answer(stats, undone_step=13, redo_step=14) is True
+    assert _tally(stats) == before
+    assert redo_review_answer(stats, redone_step=14, undo_step=15) is True
+    assert _tally(stats) == after
+
+
+def test_undo_and_redo_peel_answers_in_stack_order() -> None:
+    stats = begin_session_tracking(True, now=0)
+    assert stats is not None
+    assert (
+        accept_review_answer(
+            stats, in_tracked_deck=True, card_id=1, ease=3, undo_step=1
+        )
+        == "solid"
+    )
+    assert (
+        accept_review_answer(
+            stats, in_tracked_deck=True, card_id=2, ease=1, undo_step=2
+        )
+        == "struggle"
+    )
+    assert (
+        accept_review_answer(
+            stats, in_tracked_deck=True, card_id=2, ease=2, undo_step=3
+        )
+        == "struggle"
+    )
+    assert (
+        accept_review_answer(
+            stats, in_tracked_deck=True, card_id=1, ease=4, undo_step=4
+        )
+        == "solid"
+    )
+    assert _tally(stats) == (4, 2, 2, {1, 2}, {2})
+
+    assert undo_review_answer(stats, undone_step=4, redo_step=10) is True
+    assert _tally(stats) == (3, 1, 2, {1, 2}, {2})
+    assert undo_review_answer(stats, undone_step=3, redo_step=11) is True
+    # The earlier Again on card 2 is still standing.
+    assert stats.struggle == 1
+    assert stats.struggle_card_ids == {2}
+    assert undo_review_answer(stats, undone_step=2, redo_step=12) is True
+    assert stats.struggle_card_ids == set()
+    assert stats.answered == 1
+    assert stats.solid == 1
+    assert undo_review_answer(stats, undone_step=1, redo_step=13) is True
+    assert _tally(stats) == (0, 0, 0, set(), set())
+
+    # Redo walks back up the same stack. A later step out of order does not apply.
+    assert redo_review_answer(stats, redone_step=10, undo_step=20) is False
+    assert redo_review_answer(stats, redone_step=13, undo_step=20) is True
+    assert _tally(stats) == (1, 1, 0, {1}, set())
+    assert redo_review_answer(stats, redone_step=12, undo_step=21) is True
+    assert stats.struggle_card_ids == {2}
+    assert redo_review_answer(stats, redone_step=11, undo_step=22) is True
+    assert stats.struggle == 2
+    assert redo_review_answer(stats, redone_step=10, undo_step=23) is True
+    assert _tally(stats) == (4, 2, 2, {1, 2}, {2})
+    assert format_running_stats(stats, now=61) == (
+        "Free Review: Answered 4 · Solid 2 · Struggle 2 · 1:01"
+    )
+
+
+def test_undo_of_good_leaves_an_earlier_struggle_and_a_shown_card() -> None:
+    stats = begin_session_tracking(True, now=0)
+    assert stats is not None
+    assert note_card_seen(stats, in_tracked_deck=True, card_id=5) is True
+    assert (
+        accept_review_answer(
+            stats, in_tracked_deck=True, card_id=5, ease=1, undo_step=1
+        )
+        == "struggle"
+    )
+    assert (
+        accept_review_answer(
+            stats, in_tracked_deck=True, card_id=5, ease=3, undo_step=2
+        )
+        == "solid"
+    )
+    assert stats.struggle_card_ids == {5}
+    assert undo_review_answer(stats, undone_step=2, redo_step=3) is True
+    assert stats.answered == 1
+    assert stats.solid == 0
+    assert stats.struggle == 1
+    assert stats.struggle_card_ids == {5}
+    assert stats.seen_card_ids == {5}
+    assert undo_review_answer(stats, undone_step=1, redo_step=4) is True
+    assert stats.answered == 0
+    assert stats.struggle_card_ids == set()
+    # The card was shown before it was graded, so it stays seen.
+    assert stats.seen_card_ids == {5}
+
+    assert redo_review_answer(stats, redone_step=4, undo_step=5) is True
+    assert stats.struggle_card_ids == {5}
+    assert stats.answered == 1
+    assert redo_review_answer(stats, redone_step=3, undo_step=6) is True
+    assert _tally(stats) == (2, 1, 1, {5}, {5})
+
+    # Grading again drops the redo stack. A bad ease does not.
+    assert undo_review_answer(stats, undone_step=6, redo_step=7) is True
+    assert stats.record_answer(5, 0) is None
+    assert redo_review_answer(stats, redone_step=7, undo_step=8) is True
+    assert stats.solid == 1
+    assert undo_review_answer(stats, undone_step=8, redo_step=9) is True
+    assert (
+        accept_review_answer(
+            stats, in_tracked_deck=True, card_id=6, ease=4, undo_step=10
+        )
+        == "solid"
+    )
+    assert redo_review_answer(stats, redone_step=9, undo_step=11) is False
+    assert _tally(stats) == (2, 1, 1, {5, 6}, {5})
+    assert undo_review_answer(None, undone_step=10, redo_step=12) is False
+    assert redo_review_answer(None, redone_step=12, undo_step=13) is False

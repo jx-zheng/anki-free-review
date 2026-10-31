@@ -7,6 +7,7 @@ imported under pytest without aqt.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from dataclasses import dataclass
 
@@ -30,10 +31,12 @@ from .tracking import (
     format_running_stats,
     format_summary_text,
     note_card_seen,
+    redo_review_answer,
     should_show_summary,
     struggle_browser_search,
     summary_actions,
     tracking_enabled_from_config,
+    undo_review_answer,
 )
 
 logger = logging.getLogger(__name__)
@@ -77,6 +80,13 @@ _stats_label = None
 # answer hooks still refresh the counts; this tick only rewrites the label.
 ELAPSED_TICK_MS = 1000
 _elapsed_timer = None
+# Redo steps captured on the collection thread, applied on the UI thread.
+# Anki fires state_did_undo for Undo only. Redo has the same result shape
+# but no hook, so Collection.redo stashes the counters and the next
+# operation_did_execute drains them.
+_pending_redos: list[tuple[int, int]] = []
+_redo_lock = threading.Lock()
+_redo_bridge_installed = False
 
 
 def append_overview_button(links: list, *, deck_is_filtered: bool) -> None:
@@ -189,6 +199,8 @@ def install_hooks(gui_hooks) -> None:
     gui_hooks.sync_will_start.append(_on_sync_will_start)
     gui_hooks.reviewer_did_answer_card.append(_on_reviewer_did_answer_card)
     gui_hooks.reviewer_did_show_question.append(_on_reviewer_did_show_question)
+    gui_hooks.state_did_undo.append(_on_state_did_undo)
+    _install_redo_bridge(gui_hooks)
 
 
 def _on_overview_bottom(link_handler, links):
@@ -458,16 +470,125 @@ def _on_reviewer_did_answer_card(_reviewer, card, ease) -> None:
         if card is None:
             return
         in_deck = _reviewing_active_deck()
+        # The answer op has already committed, so last_step is that grade.
+        undo_step = None
+        if in_deck and _active.stats is not None:
+            undo_step = _latest_undo_step()
         kind = accept_review_answer(
             _active.stats,
             in_tracked_deck=in_deck,
             card_id=int(card.id),
             ease=int(ease),
+            undo_step=undo_step,
         )
         if kind is not None:
             _refresh_stats_chrome(in_tracked_deck=in_deck)
     except Exception:
         logger.exception("free-review struggle tracking failed")
+
+
+def _latest_undo_step() -> int | None:
+    """Undo counter of the op that just finished, or None if it cannot be read."""
+
+    try:
+        from aqt import mw
+
+        if not mw.col:
+            return None
+        return int(mw.col.undo_status().last_step)
+    except Exception:
+        logger.warning("free-review could not read the undo step", exc_info=True)
+        return None
+
+
+def _on_state_did_undo(changes) -> None:
+    """Pop one answer when this Undo is that grade. Other undos stay put."""
+
+    try:
+        changed = undo_review_answer(
+            _active.stats,
+            undone_step=int(changes.counter),
+            redo_step=int(changes.new_status.last_step),
+        )
+    except Exception:
+        logger.exception("free-review undo stats failed")
+        return
+    if changed:
+        _refresh_active_stats_line()
+
+
+def _install_redo_bridge(gui_hooks) -> None:
+    """Notice Redo, which does not emit state_did_undo.
+
+    Skipped when aqt is missing (the test suite). The wrap only records
+    counters; the tally is updated on the UI thread.
+    """
+
+    global _redo_bridge_installed
+    if _redo_bridge_installed:
+        return
+    try:
+        import aqt
+        from anki.collection import Collection
+    except ImportError:
+        return
+    # Pytest imports this module without the desktop package.
+    if not hasattr(aqt, "mw"):
+        return
+
+    original = Collection.redo
+
+    def redo(self):
+        out = original(self)
+        try:
+            redone_step = int(out.counter)
+            undo_step = int(out.new_status.last_step)
+        except Exception:
+            logger.warning("free-review could not read the redo step", exc_info=True)
+            return out
+        _remember_redo(redone_step, undo_step)
+        return out
+
+    Collection.redo = redo
+    gui_hooks.operation_did_execute.append(_on_operation_did_execute)
+    _redo_bridge_installed = True
+
+
+def _remember_redo(redone_step: int, undo_step: int) -> None:
+    """Queue one redo result. Safe to call from the collection thread."""
+
+    with _redo_lock:
+        _pending_redos.append((int(redone_step), int(undo_step)))
+
+
+def _on_operation_did_execute(_changes, _handler) -> None:
+    """Apply redo steps queued by Collection.redo. A no-op when none are waiting."""
+
+    with _redo_lock:
+        pending = list(_pending_redos)
+        _pending_redos.clear()
+    if not pending:
+        return
+    try:
+        changed = False
+        for redone_step, undo_step in pending:
+            if redo_review_answer(
+                _active.stats, redone_step=redone_step, undo_step=undo_step
+            ):
+                changed = True
+        if changed:
+            _refresh_active_stats_line()
+    except Exception:
+        logger.exception("free-review redo stats failed")
+
+
+def _refresh_active_stats_line() -> None:
+    """Rewrite the running line from the tally. The clock keeps moving."""
+
+    try:
+        _refresh_stats_chrome(in_tracked_deck=_reviewing_active_deck())
+    except Exception:
+        logger.debug("free-review stats line was not refreshed", exc_info=True)
 
 
 def _reviewing_active_deck() -> bool:
